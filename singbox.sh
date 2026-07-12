@@ -43,6 +43,24 @@ _traffic_manager_path() {
     [ -f "$TRAFFIC_MANAGER_SCRIPT" ] && echo "$TRAFFIC_MANAGER_SCRIPT" || echo "${SCRIPT_DIR}/traffic_manager.sh"
 }
 
+_record_created_tag() {
+    local tag="${1:-}"
+    [ -n "$tag" ] || return 0
+    case $'\n'"${CREATED_NODE_TAGS:-}"$'\n' in
+        *$'\n'"$tag"$'\n'*) return 0 ;;
+    esac
+    CREATED_NODE_TAGS="${CREATED_NODE_TAGS:+${CREATED_NODE_TAGS}$'\n'}${tag}"
+}
+
+_traffic_prompt_for_created_tags() {
+    local core="$1" tag
+    while IFS= read -r tag; do
+        [ -z "$tag" ] && continue
+        [[ "$tag" == *-hop-* ]] && continue
+        _traffic_prompt_for_tag "$core" "$tag" || true
+    done <<< "${CREATED_NODE_TAGS:-}"
+}
+
 _traffic_transaction_acquire() {
     local manager=$(_traffic_manager_path)
     [ -f "$manager" ] || return 0
@@ -71,8 +89,15 @@ _ensure_traffic_manager() {
 
 _traffic_prompt_for_tag() {
     local core="$1" tag="$2" manager answer size bytes mode reset_day
+    if ! _ensure_traffic_manager; then
+        _error "流量限制组件安装失败，无法为节点 ${tag} 设置流量限制"
+        return 1
+    fi
     manager=$(_traffic_manager_path)
-    [ -f "$manager" ] || return 0
+    if [ ! -f "$manager" ]; then
+        _error "未找到流量限制组件: ${manager}"
+        return 1
+    fi
     read -p "是否为节点 ${tag} 设置流量限制? (y/N): " answer
     TRAFFIC_QUOTA_CHANGED=false
     [[ "$answer" =~ ^[Yy]$ ]] || return 0
@@ -267,10 +292,33 @@ _ss_base64_encode() {
 }
 
 # 公网 IP 获取 (带全局缓存)
+_normalize_public_ip() {
+    printf '%s\n' "${1:-}" | awk '
+        {
+            gsub(/\r/, "")
+            sub(/^[[:space:]]+/, "")
+            sub(/[[:space:]]+$/, "")
+            if (length($0) > 0) {
+                print
+                exit
+            }
+        }
+    '
+}
+
 _get_public_ip() {
-    [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
-    local ip=$(timeout 5 curl -s4 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s4 --max-time 2 ipinfo.io/ip 2>/dev/null)
-    [ -z "$ip" ] && ip=$(timeout 5 curl -s6 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s6 --max-time 2 ipinfo.io/ip 2>/dev/null)
+    if [ -n "$server_ip" ] && [ "$server_ip" != "null" ]; then
+        server_ip=$(_normalize_public_ip "$server_ip")
+        echo "$server_ip"
+        return
+    fi
+    local raw_ip ip
+    raw_ip=$(timeout 5 curl -s4 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s4 --max-time 2 ipinfo.io/ip 2>/dev/null)
+    ip=$(_normalize_public_ip "$raw_ip")
+    if [ -z "$ip" ]; then
+        raw_ip=$(timeout 5 curl -s6 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s6 --max-time 2 ipinfo.io/ip 2>/dev/null)
+        ip=$(_normalize_public_ip "$raw_ip")
+    fi
     server_ip="$ip"
     echo "$ip"
 }
@@ -2528,6 +2576,7 @@ _show_node_link() {
     local link_ip="$3"
     local port="$4"
     local tag="$5"
+    _record_created_tag "$tag"
     # [关键修复] 处理 IPv6 括号包裹逻辑
     if [[ "$link_ip" == *":"* ]] && [[ "$link_ip" != "["* ]]; then
         link_ip="[${link_ip}]"
@@ -5689,8 +5738,8 @@ EOF
 # 批量创建节点 (v11.3 深度向导版)
 _batch_create_nodes() {
     local input_str="$1"
-    local traffic_before_tags traffic_after_tags traffic_new_tag
-    traffic_before_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
+    local traffic_new_tag
+    CREATED_NODE_TAGS=""
     if [ -z "$input_str" ]; then
         _info "请输入协议编号 (空格或逗号分隔，如: 1,6,9)"
         _warn "注：批量部署不支持含有 CDN 的协议 (2, 3, 4)"
@@ -5881,20 +5930,15 @@ _batch_create_nodes() {
     echo -e "${YELLOW}══════════════════════════════════════════════════════${NC}"
 
     _success "批量创建任务已全部完成。"
-    traffic_after_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
-    while IFS= read -r traffic_new_tag; do
-        [ -z "$traffic_new_tag" ] && continue
-        [[ "$traffic_new_tag" == *-hop-* ]] && continue
-        grep -Fxq "$traffic_new_tag" <<< "$traffic_before_tags" || _traffic_prompt_for_tag singbox "$traffic_new_tag"
-    done <<< "$traffic_after_tags"
+    _traffic_prompt_for_created_tags singbox
     _manage_service restart
-    while IFS= read -r traffic_new_tag; do [ -n "$traffic_new_tag" ] && _traffic_verify_tag singbox "$traffic_new_tag" || true; done <<< "$traffic_after_tags"
+    while IFS= read -r traffic_new_tag; do [ -n "$traffic_new_tag" ] && _traffic_verify_tag singbox "$traffic_new_tag" || true; done <<< "$CREATED_NODE_TAGS"
 }
 
 _show_add_node_menu() {
     local needs_restart=false
     local action_result
-    local before_tags after_tags new_tag
+    local new_tag
     [ -z "$server_ip" ] && _init_server_ip
     clear
     echo -e "${CYAN}"
@@ -5933,7 +5977,7 @@ _show_add_node_menu() {
         return
     fi
 
-    before_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
+    CREATED_NODE_TAGS=""
     case $choice in
         1) _add_vless_reality; action_result=$? ;;
         2) _add_vless_ws_tls; action_result=$? ;;
@@ -5952,18 +5996,13 @@ _show_add_node_menu() {
 
     if [ "$action_result" -eq 0 ] 2>/dev/null; then
         needs_restart=true
-        after_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
-        while IFS= read -r new_tag; do
-            [ -z "$new_tag" ] && continue
-            [[ "$new_tag" == *-hop-* ]] && continue
-            grep -Fxq "$new_tag" <<< "$before_tags" || _traffic_prompt_for_tag singbox "$new_tag"
-        done <<< "$after_tags"
+        _traffic_prompt_for_created_tags singbox
     fi
 
     if [ "$needs_restart" = true ]; then
         _info "配置已更新"
         _manage_service "restart"
-        while IFS= read -r new_tag; do grep -Fxq "$new_tag" <<< "$before_tags" || _traffic_verify_tag singbox "$new_tag"; done <<< "$after_tags"
+        while IFS= read -r new_tag; do [ -n "$new_tag" ] && _traffic_verify_tag singbox "$new_tag" || true; done <<< "$CREATED_NODE_TAGS"
     fi
 }
 
