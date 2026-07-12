@@ -8,7 +8,7 @@ export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/ZikL-fe/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
 # 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
@@ -32,6 +32,107 @@ _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
 _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 _warning() { _warn "$1"; } # 别名兼容
 _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
+
+TRAFFIC_MANAGER_SCRIPT="${SINGBOX_DIR}/traffic_manager.sh"
+_traffic_manager_path() {
+    [ -f "$TRAFFIC_MANAGER_SCRIPT" ] && echo "$TRAFFIC_MANAGER_SCRIPT" || echo "${SCRIPT_DIR}/traffic_manager.sh"
+}
+
+_ensure_traffic_manager() {
+    [ -f "$TRAFFIC_MANAGER_SCRIPT" ] && return 0
+    mkdir -p "$SINGBOX_DIR"
+    if [ -f "${SCRIPT_DIR}/traffic_manager.sh" ]; then
+        cp "${SCRIPT_DIR}/traffic_manager.sh" "$TRAFFIC_MANAGER_SCRIPT"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -LfsS "${GITHUB_RAW_BASE}/traffic_manager.sh" -o "$TRAFFIC_MANAGER_SCRIPT" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q "${GITHUB_RAW_BASE}/traffic_manager.sh" -O "$TRAFFIC_MANAGER_SCRIPT" || return 1
+    else
+        return 1
+    fi
+    chmod +x "$TRAFFIC_MANAGER_SCRIPT"
+}
+
+_traffic_prompt_for_tag() {
+    local core="$1" tag="$2" manager answer size bytes mode reset_day
+    manager=$(_traffic_manager_path)
+    [ -f "$manager" ] || return 0
+    read -p "是否为节点 ${tag} 设置流量限制? (y/N): " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    while true; do
+        read -p "请输入流量额度 (例如 100GB、1.5TB): " size
+        bytes=$(bash "$manager" parse-size "$size" 2>/dev/null) && [ -n "$bytes" ] && break
+        _error "流量额度格式无效"
+    done
+    echo "  [1] 一次性流量  [2] 每月重置"
+    read -p "请选择模式 [1-2]: " mode
+    if [ "$mode" = 2 ]; then
+        while true; do
+            read -p "每月几号重置 [1-31]: " reset_day
+            [[ "$reset_day" =~ ^[0-9]+$ ]] && [ "$reset_day" -ge 1 ] && [ "$reset_day" -le 31 ] && break
+            _error "重置日必须为 1-31"
+        done
+        bash "$manager" set "$core" "$tag" monthly "$bytes" "$reset_day" || { _error "流量限制初始化失败"; return 1; }
+    else
+        bash "$manager" set "$core" "$tag" once "$bytes" || { _error "流量限制初始化失败"; return 1; }
+    fi
+    _success "节点流量限制已保存"
+}
+
+_traffic_show_line() {
+    local core="$1" tag="$2" manager status used limit mode day disabled
+    manager=$(_traffic_manager_path); [ -f "$manager" ] || return 0
+    status=$(bash "$manager" status "$core" "$tag" 2>/dev/null) || return 0
+    [ "$status" = null ] && { echo -e "      流量限制: ${CYAN}无限制${NC}"; return; }
+    read -r used limit mode day disabled < <(echo "$status" | jq -r '[.used_bytes,.limit_bytes,.mode,(.reset_day//0),.disabled] | @tsv')
+    used=$(bash "$manager" format-bytes "$used"); limit=$(bash "$manager" format-bytes "$limit")
+    if [ "$disabled" = true ]; then
+        echo -e "      ${RED}流量超额，节点已停用${NC} | ${used} / ${limit}"
+    elif [ "$mode" = monthly ]; then
+        echo -e "      流量: ${YELLOW}${used} / ${limit}${NC} | 每月 ${day} 日重置"
+    else
+        echo -e "      流量: ${YELLOW}${used} / ${limit}${NC} | 一次性"
+    fi
+}
+
+_traffic_show_disabled_nodes() {
+    local core="$1" manager record tag used limit
+    manager=$(_traffic_manager_path); [ -f "$manager" ] || return 0
+    while IFS= read -r record; do
+        [ "$(echo "$record" | jq -r '.disabled // false')" = true ] || continue
+        tag=$(echo "$record" | jq -r '.tag'); used=$(echo "$record" | jq -r '.used_bytes'); limit=$(echo "$record" | jq -r '.limit_bytes')
+        used=$(bash "$manager" format-bytes "$used"); limit=$(bash "$manager" format-bytes "$limit")
+        echo "-------------------------------------"
+        echo -e "  ${CYAN}节点: ${tag}${NC}"
+        echo -e "      ${RED}流量超额，节点已停用${NC} | ${used} / ${limit}"
+    done < <(bash "$manager" list "$core" 2>/dev/null)
+}
+
+_traffic_edit_menu() {
+    local core="${1:-singbox}" config tag_field tags=() tag manager choice action size bytes mode day
+    manager=$(_traffic_manager_path); [ -f "$manager" ] || { _error "缺少 traffic_manager.sh"; return; }
+    [ "$core" = xray ] && config="/usr/local/etc/xray/config.json" || config="$CONFIG_FILE"
+    [ -f "$config" ] || { _warning "暂无节点"; return; }
+    [ "$core" = xray ] && tag_field=tag || tag_field=tag
+    while IFS= read -r tag; do [ -n "$tag" ] && tags+=("$tag"); done < <(jq -r '.inbounds[]?.tag | select(. != "traffic-api" and (contains("-hop-")|not))' "$config")
+    while IFS= read -r tag; do
+        [ -n "$tag" ] || continue
+        [[ " ${tags[*]} " == *" $tag "* ]] || tags+=("$tag")
+    done < <(bash "$manager" list "$core" 2>/dev/null | jq -r 'select(.disabled == true) | .tag')
+    [ "${#tags[@]}" -eq 0 ] && { _warning "暂无节点"; return; }
+    echo ""; echo "请选择节点:"
+    local i=1; for tag in "${tags[@]}"; do echo "  [$i] $tag"; i=$((i+1)); done
+    read -p "序号 (0取消): " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#tags[@]}" ] || return
+    tag="${tags[$((choice-1))]}"
+    echo "  [1] 设置/修改限制  [2] 清零已用流量  [3] 移除限制"
+    read -p "请选择: " action
+    case "$action" in
+        1) _traffic_prompt_for_tag "$core" "$tag" ;;
+        2) bash "$manager" reset-usage "$core" "$tag" && _success "已用流量已清零" ;;
+        3) bash "$manager" remove "$core" "$tag" && _success "已移除流量限制" ;;
+    esac
+}
 
 # 检查 root 权限
 _check_root() {
@@ -187,6 +288,11 @@ _check_port_conflict() {
     local port=$1
     local proto=${2:-tcp}
     local silent=${3:-false}
+    local traffic_manager=$(_traffic_manager_path)
+    if [ -f "$traffic_manager" ] && bash "$traffic_manager" port-in-use singbox "$port" >/dev/null 2>&1; then
+        [ "$silent" != "true" ] && _error "端口 ${port} 已被超额停用的节点保留。"
+        return 0
+    fi
     if _check_port_in_config "$port"; then
         [ "$silent" != "true" ] && _error "端口 ${port} 已在 sing-box 配置文件中被占用。"
         return 0
@@ -1267,6 +1373,7 @@ _add_argo_node() {
     else
         _show_node_link "trojan-ws" "$name" "$tunnel_domain" "443" "$tag" "$password" "$ws_path"
     fi
+    _traffic_prompt_for_tag singbox "$tag"
     
     echo "-------------------------------------------"
     if [ "$argo_type" == "temp" ]; then
@@ -2036,8 +2143,11 @@ _uninstall() {
 
     # 5. 清理组件脚本与别名 (双重清理，防止目录合并后的物理残留)
     _info "正在清理周边环境..."
+    [ -f "$TRAFFIC_MANAGER_SCRIPT" ] && bash "$TRAFFIC_MANAGER_SCRIPT" cleanup 2>/dev/null || true
+    rm -f /etc/cron.d/singbox-lite-traffic
+    rm -f "${SINGBOX_DIR}/traffic_limits.json" "${SINGBOX_DIR}/traffic_manager.sh"
     rm -f "${SINGBOX_DIR}/parser.sh" "${SINGBOX_DIR}/advanced_relay.sh" "${SINGBOX_DIR}/xray_manager.sh"
-    rm -f "${SCRIPT_DIR}/parser.sh" "${SCRIPT_DIR}/advanced_relay.sh" "${SCRIPT_DIR}/xray_manager.sh"
+    rm -f "${SCRIPT_DIR}/parser.sh" "${SCRIPT_DIR}/advanced_relay.sh" "${SCRIPT_DIR}/xray_manager.sh" "${SCRIPT_DIR}/traffic_manager.sh"
     rm -f "/usr/local/bin/sb"
     
     # 5. 复原 MOTD
@@ -3994,10 +4104,12 @@ _add_socks() {
 }
 
 _view_nodes() {
-    if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then _warning "当前没有任何节点。"; return; fi
+    local traffic_manager=$(_traffic_manager_path)
+    if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1 && { [ ! -f "$traffic_manager" ] || [ -z "$(bash "$traffic_manager" list singbox 2>/dev/null)" ]; }; then _warning "当前没有任何节点。"; return; fi
     
     # 统计有效节点数量（排除辅助节点）
     local node_count=$(jq '[.inbounds[] | select(.tag | contains("-hop-") | not)] | length' "$CONFIG_FILE")
+    [ -f "$traffic_manager" ] && node_count=$((node_count + $(bash "$traffic_manager" list singbox 2>/dev/null | jq -s '[.[] | select(.disabled == true)] | length' 2>/dev/null || echo 0)))
     _info "--- 当前节点信息 (共 ${node_count} 个) ---"
     
     # [关键修复] 确保在查看前清空之前的临时链接缓存
@@ -4031,6 +4143,7 @@ _view_nodes() {
         echo "-------------------------------------"
         # [!] 已修改：使用 display_name
         _info " 节点: ${display_name}"
+        _traffic_show_line singbox "$tag"
         local url=""
         
         # [新架构] 优先使用持久化生成的链接（从极源解决动态提取可能存在的 SNI 丢失死角）
@@ -4174,6 +4287,7 @@ _view_nodes() {
         [ -n "$url" ] && echo "$url" >> /tmp/singbox_links.tmp
     done
     echo "-------------------------------------"
+    _traffic_show_disabled_nodes singbox
     
     # 生成聚合 Base64 选项
     if [ -f /tmp/singbox_links.tmp ]; then
@@ -4268,6 +4382,8 @@ _delete_node() {
         # 清空配置
         _atomic_modify_json "$CONFIG_FILE" '.inbounds = []'
         _atomic_modify_json "$METADATA_FILE" '{}'
+        local traffic_manager=$(_traffic_manager_path)
+        [ -f "$traffic_manager" ] && bash "$traffic_manager" clear-core singbox 2>/dev/null || true
         
         # 清空 clash.yaml 中的代理
         _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxies = []'
@@ -4335,6 +4451,8 @@ _delete_node() {
     _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(select(.tag | startswith(\"$tag_to_del-hop-\") | not))" 2>/dev/null
     
     _atomic_modify_json "$METADATA_FILE" "del(.\"$tag_to_del\")" || return
+    local traffic_manager=$(_traffic_manager_path)
+    [ -f "$traffic_manager" ] && bash "$traffic_manager" delete singbox "$tag_to_del" 2>/dev/null || true
     
     # [!] 已修改：使用找到的 proxy_name_to_del 从 clash.yaml 中删除
     if [ -n "$proxy_name_to_del" ]; then
@@ -4725,6 +4843,8 @@ _modify_port() {
     fi
     
     _success "端口修改成功: ${old_port} -> ${new_port}"
+    local traffic_manager=$(_traffic_manager_path)
+    [ -f "$traffic_manager" ] && bash "$traffic_manager" edit-identity singbox "$tag_to_modify" "${final_tag:-$new_tag}" "$old_port" "$new_port" 2>/dev/null || true
     _manage_service "restart"
 }
 
@@ -4759,7 +4879,7 @@ _update_script() {
     fi
     
     # 需要更新的子脚本列表
-    local sub_scripts=("advanced_relay.sh" "parser.sh" "xray_manager.sh")
+    local sub_scripts=("advanced_relay.sh" "parser.sh" "xray_manager.sh" "traffic_manager.sh")
     
     for script_name in "${sub_scripts[@]}"; do
         local updated=false
@@ -5188,7 +5308,7 @@ _main_menu() {
         echo -e "  ${CYAN}【节点管理】${NC}"
         echo -e "    ${GREEN}[1]${NC} 添加节点          ${GREEN}[2]${NC} Argo 隧道节点"
         echo -e "    ${GREEN}[3]${NC} 查看节点链接      ${GREEN}[4]${NC} 删除节点"
-        echo -e "    ${GREEN}[5]${NC} 修改节点端口"
+        echo -e "    ${GREEN}[5]${NC} 修改节点端口      ${GREEN}[19]${NC} 流量限制管理"
         echo ""
         
         # 服务控制
@@ -5242,6 +5362,7 @@ _main_menu() {
             16) _uninstall ;; 
             17) _require_singbox && _advanced_features ;;
             18) _xray_features ;;
+            19) _require_singbox && _traffic_edit_menu singbox ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -5484,6 +5605,8 @@ EOF
 # 批量创建节点 (v11.3 深度向导版)
 _batch_create_nodes() {
     local input_str="$1"
+    local traffic_before_tags traffic_after_tags traffic_new_tag
+    traffic_before_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
     if [ -z "$input_str" ]; then
         _info "请输入协议编号 (空格或逗号分隔，如: 1,6,9)"
         _warn "注：批量部署不支持含有 CDN 的协议 (2, 3, 4)"
@@ -5674,12 +5797,19 @@ _batch_create_nodes() {
     echo -e "${YELLOW}══════════════════════════════════════════════════════${NC}"
 
     _success "批量创建任务已全部完成。"
+    traffic_after_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
+    while IFS= read -r traffic_new_tag; do
+        [ -z "$traffic_new_tag" ] && continue
+        [[ "$traffic_new_tag" == *-hop-* ]] && continue
+        grep -Fxq "$traffic_new_tag" <<< "$traffic_before_tags" || _traffic_prompt_for_tag singbox "$traffic_new_tag"
+    done <<< "$traffic_after_tags"
     _manage_service restart
 }
 
 _show_add_node_menu() {
     local needs_restart=false
     local action_result
+    local before_tags after_tags new_tag
     [ -z "$server_ip" ] && _init_server_ip
     clear
     echo -e "${CYAN}"
@@ -5718,6 +5848,7 @@ _show_add_node_menu() {
         return
     fi
 
+    before_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
     case $choice in
         1) _add_vless_reality; action_result=$? ;;
         2) _add_vless_ws_tls; action_result=$? ;;
@@ -5736,6 +5867,12 @@ _show_add_node_menu() {
 
     if [ "$action_result" -eq 0 ] 2>/dev/null; then
         needs_restart=true
+        after_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
+        while IFS= read -r new_tag; do
+            [ -z "$new_tag" ] && continue
+            [[ "$new_tag" == *-hop-* ]] && continue
+            grep -Fxq "$new_tag" <<< "$before_tags" || _traffic_prompt_for_tag singbox "$new_tag"
+        done <<< "$after_tags"
     fi
 
     if [ "$needs_restart" = true ]; then
@@ -5755,6 +5892,7 @@ main() {
     
     # 1. 首次安装或依赖状态失效时才完整检查，避免每次 sb 进入菜单都触发包管理器
     _install_dependencies
+    _ensure_traffic_manager || _warn "流量限制组件暂不可用，可稍后通过更新脚本重试。"
     
     # 2. 根据核心安装状态决定初始化路径
     if [ -f "${SINGBOX_BIN}" ]; then

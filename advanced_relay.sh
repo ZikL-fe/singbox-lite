@@ -4,7 +4,7 @@
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/ZikL-fe/singbox-lite/main"
 
 # [整合方案] 检测父进程导出的工具函数
 # 如果独立运行且函数缺失，可在此定义最简兜底逻辑 (可选)
