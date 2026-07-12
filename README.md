@@ -24,6 +24,23 @@
 - 🔗 **双格式输出** - 自动生成分享链接 + Clash YAML 配置
 - 🔧 **端口全同步** - 修改端口时标签、名称、分享链接、YAML 四处联动更新
 
+### 节点流量限制
+
+- **可选配置** - 新增节点时可直接回车保持无限流量，不影响已有节点
+- **上下行合计** - 已用流量按节点上行与下行流量之和计算
+- **一次性额度** - 累计用完后自动停用，手动清零、提高额度或取消限制后恢复
+- **月度额度** - 支持设置每月 1-31 日重置；当月没有指定日期时在月末重置
+- **超额停用** - 后台每分钟检查一次，超额后移出活动入站并保留节点资料
+- **用量展示** - 节点列表显示已用/总量，超额节点以红色提示“流量超额，节点已停用”
+- **后续编辑** - Sing-box 主菜单 `[19]`、Xray 管理菜单 `[10]` 可修改额度、模式、重置日、清零用量或取消限制
+- **低内存设计** - 检查任务按分钟短暂运行，不增加常驻管理进程；统计 API 仅监听本机
+
+> 流量限制按分钟执行，并非逐数据包硬限额。高带宽节点可能在一次检查间隔内少量超过额度。
+>
+> 流量统计通过 Xray 的本地 API 客户端查询。即使只限制 Sing-box 节点，也需要先通过主菜单安装 Xray 核心；流量管理不会额外启动新的常驻监控服务。
+>
+> 为控制配置和状态文件大小，启用原生端口跳跃的单个 Hysteria2 节点最多支持统计 512 个入站端口。更大的端口范围可继续使用，但不能为该节点启用流量限制。
+
 ### 进阶脚本 (advanced_relay.sh)
 
 - 🔀 **中转配置** - 支持落地机/中转机完整配置流程
@@ -86,7 +103,7 @@
 进入交互菜单手动配置节点：
 
 ```
-(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
+(curl -LfsS https://raw.githubusercontent.com/ZikL-fe/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/ZikL-fe/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 
 **快捷命令：sb**
