@@ -40,6 +40,7 @@ if ! declare -f _traffic_prompt_for_tag >/dev/null 2>&1; then
         local core="$1" tag="$2" answer size bytes mode day
         [ -f "$TRAFFIC_MANAGER_SCRIPT" ] || return 0
         read -p "是否为节点 ${tag} 设置流量限制? (y/N): " answer
+        TRAFFIC_QUOTA_CHANGED=false
         [[ "$answer" =~ ^[Yy]$ ]] || return 0
         while true; do
             read -p "请输入流量额度 (例如 100GB、1.5TB): " size
@@ -49,10 +50,11 @@ if ! declare -f _traffic_prompt_for_tag >/dev/null 2>&1; then
         echo "  [1] 一次性流量  [2] 每月重置"; read -p "请选择模式 [1-2]: " mode
         if [ "$mode" = 2 ]; then
             while true; do read -p "每月几号重置 [1-31]: " day; [[ "$day" =~ ^[0-9]+$ ]] && [ "$day" -ge 1 ] && [ "$day" -le 31 ] && break; done
-            bash "$TRAFFIC_MANAGER_SCRIPT" set "$core" "$tag" monthly "$bytes" "$day" || { _error "流量限制初始化失败"; return 1; }
+            bash "$TRAFFIC_MANAGER_SCRIPT" set "$core" "$tag" monthly "$bytes" "$day" true || { _error "流量限制初始化失败"; return 1; }
         else
-            bash "$TRAFFIC_MANAGER_SCRIPT" set "$core" "$tag" once "$bytes" || { _error "流量限制初始化失败"; return 1; }
+            bash "$TRAFFIC_MANAGER_SCRIPT" set "$core" "$tag" once "$bytes" "" true || { _error "流量限制初始化失败"; return 1; }
         fi
+        TRAFFIC_QUOTA_CHANGED=true
         _success "节点流量限制已保存"
     }
 fi
@@ -66,6 +68,19 @@ if ! declare -f _traffic_show_line >/dev/null 2>&1; then
         read -r used limit mode day disabled < <(echo "$status" | jq -r '[.used_bytes,.limit_bytes,.mode,(.reset_day//0),.disabled] | @tsv')
         used=$(bash "$TRAFFIC_MANAGER_SCRIPT" format-bytes "$used"); limit=$(bash "$TRAFFIC_MANAGER_SCRIPT" format-bytes "$limit")
         [ "$disabled" = true ] && echo -e "      ${RED}流量超额，节点已停用${NC} | ${used} / ${limit}" || echo -e "      流量: ${YELLOW}${used} / ${limit}${NC}$([ "$mode" = monthly ] && echo " | 每月 ${day} 日重置" || echo " | 一次性")"
+    }
+fi
+
+if ! declare -f _traffic_verify_tag >/dev/null 2>&1; then
+    _traffic_verify_tag() {
+        local core="$1" tag="$2"
+        [ -f "$TRAFFIC_MANAGER_SCRIPT" ] || return 1
+        [ "$(bash "$TRAFFIC_MANAGER_SCRIPT" status "$core" "$tag" 2>/dev/null)" = null ] && return 0
+        if ! bash "$TRAFFIC_MANAGER_SCRIPT" probe "$core" "$tag" >/dev/null 2>&1; then
+            bash "$TRAFFIC_MANAGER_SCRIPT" remove "$core" "$tag" >/dev/null 2>&1 || true
+            _error "节点 ${tag} 的统计 API 兼容性探测失败，已撤销流量限制"
+            return 1
+        fi
     }
 fi
 
@@ -83,6 +98,8 @@ if ! declare -f _traffic_show_disabled_nodes >/dev/null 2>&1; then
 fi
 
 _xray_traffic_edit_menu() {
+    _xray_traffic_transaction_acquire || return
+    trap '_xray_traffic_transaction_release' RETURN
     local tags=() tag choice action
     [ -f "$TRAFFIC_MANAGER_SCRIPT" ] || { _error "缺少 traffic_manager.sh"; return; }
     while IFS= read -r tag; do [ -n "$tag" ] && tags+=("$tag"); done < <(jq -r '.inbounds[]?.tag | select(. != "traffic-api")' "$XRAY_CONFIG")
@@ -92,12 +109,38 @@ _xray_traffic_edit_menu() {
     read -p "序号 (0取消): " choice
     [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#tags[@]}" ] || return
     tag="${tags[$((choice-1))]}"
-    echo "  [1] 设置/修改限制  [2] 清零已用流量  [3] 移除限制"; read -p "请选择: " action
+    echo "  [1] 设置/修改限制  [2] 清零已用流量  [3] 移除限制  [4] 删除已停用节点  [5] 恢复后修改端口"; read -p "请选择: " action
     case "$action" in
-        1) _traffic_prompt_for_tag xray "$tag" ;;
+        1) _traffic_prompt_for_tag xray "$tag"; [ "$TRAFFIC_QUOTA_CHANGED" = true ] && _manage_xray_service restart; [ "$TRAFFIC_QUOTA_CHANGED" = true ] && _traffic_verify_tag xray "$tag" ;;
         2) bash "$TRAFFIC_MANAGER_SCRIPT" reset-usage xray "$tag" && _success "已用流量已清零" ;;
         3) bash "$TRAFFIC_MANAGER_SCRIPT" remove xray "$tag" && _success "已移除流量限制" ;;
+        4)
+            if [ "$(bash "$TRAFFIC_MANAGER_SCRIPT" status xray "$tag" | jq -r '.disabled // false')" != true ]; then _warn "只有超额停用节点可从此处删除"; return; fi
+            local node_name; node_name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$XRAY_METADATA" 2>/dev/null)
+            [ -n "$node_name" ] && _remove_node_from_yaml "$node_name"
+            _atomic_modify_json "$XRAY_METADATA" "del(.\"$tag\")" 2>/dev/null || true
+            rm -f "${XRAY_DIR}/${tag}.pem" "${XRAY_DIR}/${tag}.key"
+            bash "$TRAFFIC_MANAGER_SCRIPT" purge xray "$tag" && _manage_xray_service restart && _success "已删除停用节点及其配额记录"
+            ;;
+        5)
+            if [ "$(bash "$TRAFFIC_MANAGER_SCRIPT" status xray "$tag" | jq -r '.disabled // false')" = true ]; then
+                bash "$TRAFFIC_MANAGER_SCRIPT" restore xray "$tag" || return
+                _info "节点已临时恢复，请在端口修改菜单中选择该节点完成标签/端口同步。"
+            fi
+            _modify_xray_port "$tag"
+            _xray_traffic_transaction_release
+            bash "$TRAFFIC_MANAGER_SCRIPT" check >/dev/null 2>&1 || true
+            ;;
     esac
+}
+
+_xray_traffic_transaction_acquire() {
+    [ -f "$TRAFFIC_MANAGER_SCRIPT" ] || return 0
+    TM_LOCK_OWNER_PID=$$ bash "$TRAFFIC_MANAGER_SCRIPT" acquire-lock || { _error "流量检查任务正在更新配置，请稍后重试"; return 1; }
+}
+_xray_traffic_transaction_release() {
+    [ -f "$TRAFFIC_MANAGER_SCRIPT" ] && bash "$TRAFFIC_MANAGER_SCRIPT" release-lock >/dev/null 2>&1 || true
+    trap - RETURN
 }
 
 # --- URL 编码 ---
@@ -1268,6 +1311,8 @@ _delete_xray_node() {
     if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select(.tag != "traffic-api")] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点可删除。"; return
     fi
+    _xray_traffic_transaction_acquire || return
+    trap '_xray_traffic_transaction_release' RETURN
     [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
     local tags=()
     local names=()
@@ -1331,9 +1376,12 @@ _delete_all_xray_nodes() {
 }
 
 _modify_xray_port() {
+    local forced_tag="${1:-}"
     if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '[.inbounds[]? | select(.tag != "traffic-api")] | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点。"; return
     fi
+    _xray_traffic_transaction_acquire || return
+    trap '_xray_traffic_transaction_release' RETURN
     [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
     local tags=()
     local names=()
@@ -1355,7 +1403,14 @@ _modify_xray_port() {
     ' "$XRAY_CONFIG" 2>/dev/null)
     echo -e "  ${RED}[0]${NC} 返回"
     echo ""
-    read -p "请选择 [0-${#tags[@]}]: " choice
+    local choice=""
+    if [ -n "$forced_tag" ]; then
+        local forced_i
+        for forced_i in "${!tags[@]}"; do [ "${tags[$forced_i]}" = "$forced_tag" ] && choice=$((forced_i + 1)); done
+        [ -n "$choice" ] || { _error "未找到待修改节点 ${forced_tag}"; return 1; }
+    else
+        read -p "请选择 [0-${#tags[@]}]: " choice
+    fi
     [ "$choice" == "0" ] && return
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#tags[@]}" ]; then
         _error "无效选择！"; return
@@ -1458,6 +1513,7 @@ _xray_add_node_menu() {
                 grep -Fxq "$new_tag" <<< "$before_tags" || _traffic_prompt_for_tag xray "$new_tag"
             done <<< "$after_tags"
             _manage_xray_service "restart"
+            while IFS= read -r new_tag; do grep -Fxq "$new_tag" <<< "$before_tags" || _traffic_verify_tag xray "$new_tag"; done <<< "$after_tags"
         fi
         echo ""; read -p "按回车键继续..."
     done

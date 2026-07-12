@@ -38,6 +38,17 @@ _traffic_manager_path() {
     [ -f "$TRAFFIC_MANAGER_SCRIPT" ] && echo "$TRAFFIC_MANAGER_SCRIPT" || echo "${SCRIPT_DIR}/traffic_manager.sh"
 }
 
+_traffic_transaction_acquire() {
+    local manager=$(_traffic_manager_path)
+    [ -f "$manager" ] || return 0
+    TM_LOCK_OWNER_PID=$$ bash "$manager" acquire-lock || { _error "流量检查任务正在更新配置，请稍后重试"; return 1; }
+}
+_traffic_transaction_release() {
+    local manager=$(_traffic_manager_path)
+    [ -f "$manager" ] && bash "$manager" release-lock >/dev/null 2>&1 || true
+    trap - RETURN
+}
+
 _ensure_traffic_manager() {
     [ -f "$TRAFFIC_MANAGER_SCRIPT" ] && return 0
     mkdir -p "$SINGBOX_DIR"
@@ -58,6 +69,7 @@ _traffic_prompt_for_tag() {
     manager=$(_traffic_manager_path)
     [ -f "$manager" ] || return 0
     read -p "是否为节点 ${tag} 设置流量限制? (y/N): " answer
+    TRAFFIC_QUOTA_CHANGED=false
     [[ "$answer" =~ ^[Yy]$ ]] || return 0
     while true; do
         read -p "请输入流量额度 (例如 100GB、1.5TB): " size
@@ -72,19 +84,21 @@ _traffic_prompt_for_tag() {
             [[ "$reset_day" =~ ^[0-9]+$ ]] && [ "$reset_day" -ge 1 ] && [ "$reset_day" -le 31 ] && break
             _error "重置日必须为 1-31"
         done
-        bash "$manager" set "$core" "$tag" monthly "$bytes" "$reset_day" || { _error "流量限制初始化失败"; return 1; }
+        bash "$manager" set "$core" "$tag" monthly "$bytes" "$reset_day" true || { _error "流量限制初始化失败"; return 1; }
     else
-        bash "$manager" set "$core" "$tag" once "$bytes" || { _error "流量限制初始化失败"; return 1; }
+        bash "$manager" set "$core" "$tag" once "$bytes" "" true || { _error "流量限制初始化失败"; return 1; }
     fi
+    TRAFFIC_QUOTA_CHANGED=true
     _success "节点流量限制已保存"
 }
 
 _traffic_show_line() {
-    local core="$1" tag="$2" manager status used limit mode day disabled
+    local core="$1" tag="$2" manager status used limit mode day disabled last_error
     manager=$(_traffic_manager_path); [ -f "$manager" ] || return 0
     status=$(bash "$manager" status "$core" "$tag" 2>/dev/null) || return 0
     [ "$status" = null ] && { echo -e "      流量限制: ${CYAN}无限制${NC}"; return; }
     read -r used limit mode day disabled < <(echo "$status" | jq -r '[.used_bytes,.limit_bytes,.mode,(.reset_day//0),.disabled] | @tsv')
+    last_error=$(echo "$status" | jq -r '.last_error // empty')
     used=$(bash "$manager" format-bytes "$used"); limit=$(bash "$manager" format-bytes "$limit")
     if [ "$disabled" = true ]; then
         echo -e "      ${RED}流量超额，节点已停用${NC} | ${used} / ${limit}"
@@ -92,6 +106,18 @@ _traffic_show_line() {
         echo -e "      流量: ${YELLOW}${used} / ${limit}${NC} | 每月 ${day} 日重置"
     else
         echo -e "      流量: ${YELLOW}${used} / ${limit}${NC} | 一次性"
+    fi
+    [ -n "$last_error" ] && echo -e "      ${RED}流量统计异常，请检查核心 API${NC}"
+}
+
+_traffic_verify_tag() {
+    local core="$1" tag="$2" manager
+    manager=$(_traffic_manager_path); [ -f "$manager" ] || return 1
+    [ "$(bash "$manager" status "$core" "$tag" 2>/dev/null)" = null ] && return 0
+    if ! bash "$manager" probe "$core" "$tag" >/dev/null 2>&1; then
+        bash "$manager" remove "$core" "$tag" >/dev/null 2>&1 || true
+        _error "节点 ${tag} 的统计 API 兼容性探测失败，已撤销流量限制"
+        return 1
     fi
 }
 
@@ -109,6 +135,8 @@ _traffic_show_disabled_nodes() {
 }
 
 _traffic_edit_menu() {
+    _traffic_transaction_acquire || return
+    trap '_traffic_transaction_release' RETURN
     local core="${1:-singbox}" config tag_field tags=() tag manager choice action size bytes mode day
     manager=$(_traffic_manager_path); [ -f "$manager" ] || { _error "缺少 traffic_manager.sh"; return; }
     [ "$core" = xray ] && config="/usr/local/etc/xray/config.json" || config="$CONFIG_FILE"
@@ -125,12 +153,34 @@ _traffic_edit_menu() {
     read -p "序号 (0取消): " choice
     [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#tags[@]}" ] || return
     tag="${tags[$((choice-1))]}"
-    echo "  [1] 设置/修改限制  [2] 清零已用流量  [3] 移除限制"
+    echo "  [1] 设置/修改限制  [2] 清零已用流量  [3] 移除限制  [4] 删除已停用节点  [5] 恢复后修改端口"
     read -p "请选择: " action
     case "$action" in
-        1) _traffic_prompt_for_tag "$core" "$tag" ;;
+        1) _traffic_prompt_for_tag "$core" "$tag"; [ "$TRAFFIC_QUOTA_CHANGED" = true ] && { [ "$core" = xray ] && systemctl restart xray 2>/dev/null || _manage_service restart; }; [ "$TRAFFIC_QUOTA_CHANGED" = true ] && _traffic_verify_tag "$core" "$tag" ;;
         2) bash "$manager" reset-usage "$core" "$tag" && _success "已用流量已清零" ;;
         3) bash "$manager" remove "$core" "$tag" && _success "已移除流量限制" ;;
+        4)
+            if [ "$(bash "$manager" status "$core" "$tag" | jq -r '.disabled // false')" != true ]; then _warn "只有超额停用节点可从此处删除"; return; fi
+            local saved_port saved_type proxy_name
+            saved_port=$(bash "$manager" status "$core" "$tag" | jq -r '.saved_primary_inbound.listen_port // .saved_primary_inbound.port // .saved_inbounds[0].listen_port // .saved_inbounds[0].port // empty')
+            saved_type=$(bash "$manager" status "$core" "$tag" | jq -r '.saved_primary_inbound.type // .saved_inbounds[0].type // empty')
+            proxy_name=$(_find_proxy_name "$saved_port" "$saved_type" "$tag")
+            [ -n "$proxy_name" ] && _remove_node_from_yaml "$proxy_name"
+            _atomic_modify_json "$METADATA_FILE" "del(.\"$tag\")" 2>/dev/null || true
+            [ -f "$ARGO_METADATA_FILE" ] && _atomic_modify_json "$ARGO_METADATA_FILE" "del(.\"$tag\")" 2>/dev/null || true
+            [ -n "$saved_port" ] && _stop_argo_tunnel "$saved_port"
+            rm -f "${SINGBOX_DIR}/${tag}.pem" "${SINGBOX_DIR}/${tag}.key"
+            bash "$manager" purge "$core" "$tag" && _success "已删除停用节点及其配额记录"
+            ;;
+        5)
+            if [ "$(bash "$manager" status "$core" "$tag" | jq -r '.disabled // false')" = true ]; then
+                bash "$manager" restore "$core" "$tag" || return
+                _info "节点已临时恢复，请在端口修改菜单中选择该节点完成标签/端口同步。"
+            fi
+            _modify_port "$tag"
+            _traffic_transaction_release
+            bash "$manager" check >/dev/null 2>&1 || true
+            ;;
     esac
 }
 
@@ -1374,6 +1424,8 @@ _add_argo_node() {
         _show_node_link "trojan-ws" "$name" "$tunnel_domain" "443" "$tag" "$password" "$ws_path"
     fi
     _traffic_prompt_for_tag singbox "$tag"
+    [ "$TRAFFIC_QUOTA_CHANGED" = true ] && _manage_service restart
+    [ "$TRAFFIC_QUOTA_CHANGED" = true ] && _traffic_verify_tag singbox "$tag"
     
     echo "-------------------------------------------"
     if [ "$argo_type" == "temp" ]; then
@@ -4307,6 +4359,8 @@ _view_nodes() {
 
 _delete_node() {
     if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then _warning "当前没有任何节点。"; return; fi
+    _traffic_transaction_acquire || return
+    trap '_traffic_transaction_release' RETURN
     _info "--- 节点删除 ---"
     
     # --- [!] 新的列表逻辑 ---
@@ -4520,11 +4574,14 @@ _check_config() {
 }
 
 _modify_port() {
+    local forced_tag="${1:-}"
     if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
         _warning "当前没有任何节点。"
         return
     fi
     
+    _traffic_transaction_acquire || return
+    trap '_traffic_transaction_release' RETURN
     _info "--- 修改节点端口 ---"
     
     # 列出所有节点
@@ -4554,7 +4611,14 @@ _modify_port() {
         ((i++))
     done < <(jq -r '.inbounds[] | [.tag, .type, (.listen_port|tostring)] | @tsv' "$CONFIG_FILE")
     
-    read -p "请输入要修改端口的节点编号 (输入 0 返回): " num
+    local num=""
+    if [ -n "$forced_tag" ]; then
+        local forced_i
+        for forced_i in "${!inbound_tags[@]}"; do [ "${inbound_tags[$forced_i]}" = "$forced_tag" ] && num=$((forced_i + 1)); done
+        [ -n "$num" ] || { _error "未找到待修改节点 ${forced_tag}"; return 1; }
+    else
+        read -p "请输入要修改端口的节点编号 (输入 0 返回): " num
+    fi
     
     [[ ! "$num" =~ ^[0-9]+$ ]] || [ "$num" -eq 0 ] && return
     
@@ -5804,6 +5868,7 @@ _batch_create_nodes() {
         grep -Fxq "$traffic_new_tag" <<< "$traffic_before_tags" || _traffic_prompt_for_tag singbox "$traffic_new_tag"
     done <<< "$traffic_after_tags"
     _manage_service restart
+    while IFS= read -r traffic_new_tag; do [ -n "$traffic_new_tag" ] && _traffic_verify_tag singbox "$traffic_new_tag" || true; done <<< "$traffic_after_tags"
 }
 
 _show_add_node_menu() {
@@ -5878,6 +5943,7 @@ _show_add_node_menu() {
     if [ "$needs_restart" = true ]; then
         _info "配置已更新"
         _manage_service "restart"
+        while IFS= read -r new_tag; do grep -Fxq "$new_tag" <<< "$before_tags" || _traffic_verify_tag singbox "$new_tag"; done <<< "$after_tags"
     fi
 }
 

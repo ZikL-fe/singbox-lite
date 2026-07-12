@@ -18,9 +18,11 @@ export TM_LOCK_DIR="$tmp/traffic.lock"
 export TM_RESTART_SINGBOX_CMD="printf restarted > '$tmp/singbox.restart'"
 export TM_RESTART_XRAY_CMD="printf 'restarted\\n' >> '$tmp/xray.restart'"
 export TM_XRAY_BIN="$tmp/fake-xray"
+export TM_SINGBOX_BIN="$tmp/fake-singbox"
 mkdir -p "$TM_DIR" "$tmp/xray"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TM_XRAY_BIN"
 chmod +x "$TM_XRAY_BIN"
+cp "$TM_XRAY_BIN" "$TM_SINGBOX_BIN"
 
 cat > "$TM_SINGBOX_CONFIG" <<'JSON'
 {"inbounds":[{"type":"vless","tag":"vless-in-443","listen":"::","listen_port":443}],"outbounds":[],"route":{"rules":[]}}
@@ -84,6 +86,33 @@ chmod +x "$tmp/query"
 _tm_check
 jq -e '.["singbox:monthly-active"].used_bytes == 300' "$TM_STATE_FILE" >/dev/null
 
+jq '.inbounds += [{"type":"hysteria2","tag":"hy2-in-3000","listen":"::","listen_port":3000},{"type":"hysteria2","tag":"hy2-in-3000-hop-3001","listen":"::","listen_port":3001}]' "$TM_SINGBOX_CONFIG" > "$TM_SINGBOX_CONFIG.tmp"
+mv "$TM_SINGBOX_CONFIG.tmp" "$TM_SINGBOX_CONFIG"
+_tm_set singbox hy2-in-3000 once 100 "" true
+cat > "$tmp/query" <<'SH'
+#!/usr/bin/env bash
+if [ "$2" = hy2-in-3000 ]; then printf '200\n100\n100\n'; else printf '0\n0\n0\n'; fi
+SH
+chmod +x "$tmp/query"
+_tm_check
+jq -e '.["singbox:hy2-in-3000"].disabled == true and .["singbox:hy2-in-3000"].saved_helper_start == 3001 and .["singbox:hy2-in-3000"].saved_helper_end == 3001 and .["singbox:hy2-in-3000"].saved_inbounds == null' "$TM_STATE_FILE" >/dev/null
+_tm_reset_usage singbox hy2-in-3000
+jq -e '[.inbounds[] | select(.tag == "hy2-in-3000" or .tag == "hy2-in-3000-hop-3001")] | length == 2' "$TM_SINGBOX_CONFIG" >/dev/null
+
+jq '.inbounds += [{"type":"vless","tag":"rollback-node","listen":"::","listen_port":4555}]' "$TM_SINGBOX_CONFIG" > "$TM_SINGBOX_CONFIG.tmp"
+mv "$TM_SINGBOX_CONFIG.tmp" "$TM_SINGBOX_CONFIG"
+_tm_set singbox rollback-node once 100 "" true
+cat > "$tmp/query" <<'SH'
+#!/usr/bin/env bash
+if [ "$2" = rollback-node ]; then printf '200\n100\n100\n'; else printf '0\n0\n0\n'; fi
+SH
+chmod +x "$tmp/query"
+export TM_RESTART_SINGBOX_CMD=false
+if _tm_check; then echo "expected failed restart rollback" >&2; exit 1; fi
+jq -e '.["singbox:rollback-node"].disabled == false and .["singbox:rollback-node"].used_bytes == 0' "$TM_STATE_FILE" >/dev/null
+jq -e '[.inbounds[] | select(.tag == "rollback-node")] | length == 1' "$TM_SINGBOX_CONFIG" >/dev/null
+export TM_RESTART_SINGBOX_CMD="printf restarted > '$tmp/singbox.restart'"
+
 cat > "$tmp/query" <<'SH'
 #!/usr/bin/env bash
 if [ "$1" = xray ]; then printf '800\n400\n400\n'; else printf '0\n0\n0\n'; fi
@@ -91,6 +120,7 @@ SH
 chmod +x "$tmp/query"
 _tm_set xray xray-vless-8443 once 500
 _tm_set xray xray-trojan-9443 once 500
+: > "$tmp/xray.restart"
 _tm_check
 jq -e '.["xray:xray-vless-8443"].disabled == true and .["xray:xray-trojan-9443"].disabled == true' "$TM_STATE_FILE" >/dev/null
 jq -e '([.inbounds[] | select(.tag == "traffic-api")] | length) == 1 and ([.inbounds[] | select(.tag != "traffic-api")] | length) == 0' "$TM_XRAY_CONFIG" >/dev/null
