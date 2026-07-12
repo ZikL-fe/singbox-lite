@@ -1659,17 +1659,16 @@ _pf_view() {
 # 安装/卸载 DNS 定时刷新 cron 任务
 _pf_setup_dns_cron() {
     local SCRIPT_PATH="$(readlink -f "$0")"
-    local CRON_CMD="*/5 * * * * ${SCRIPT_PATH} pf-dns-refresh >/dev/null 2>&1"
+    local CRON_CMD="* * * * * /bin/bash \"${SCRIPT_PATH}\" pf-dns-refresh >/dev/null 2>&1"
     local CRON_TAG="# pf-dns-auto-refresh"
-    
-    # 检查是否已安装
-    if crontab -l 2>/dev/null | grep -qF "$CRON_TAG"; then
-        return 0
+
+    # 始终替换带标签的旧任务，确保检查周期和脚本绝对路径保持最新。
+    # 旧实现检测到标签后直接返回，导致 */5 的旧任务或失效路径永远不会被修复。
+    if ! (crontab -l 2>/dev/null | grep -vF "$CRON_TAG"; echo "${CRON_CMD} ${CRON_TAG}") | crontab -; then
+        _warning "安装域名动态刷新定时任务失败，请检查 cron/crond 服务"
+        return 1
     fi
-    
-    # 添加 cron 任务
-    (crontab -l 2>/dev/null | grep -v "$CRON_TAG"; echo "${CRON_CMD} ${CRON_TAG}") | crontab -
-    _info "已安装域名动态刷新定时任务 (每 5 分钟检查一次)"
+    _info "已安装域名动态刷新定时任务 (每 1 分钟检查一次)"
 }
 
 _pf_remove_dns_cron() {
@@ -2362,6 +2361,16 @@ _pf_clear() {
 _pf_dns_refresh() {
     [ ! -f "$PF_METADATA_FILE" ] && return 0
     local updated=false
+    local refresh_list=""
+
+    # 不使用“jq | while”管道，避免循环在子 Shell 中运行后丢失 updated 状态。
+    refresh_list=$(mktemp /tmp/singboxlite-pf-dns.XXXXXX) || return 1
+    if ! jq -r 'to_entries[] | select(.value.engine == "nftables" and .value.target_is_domain == true and .value.resolved_ip != null) | [.key, .value.target_addr, .value.resolved_ip, (.value.target_port|tostring), .value.network, (.value.target_family // "ipv4")] | @tsv' \
+        "$PF_METADATA_FILE" > "$refresh_list" 2>/dev/null; then
+        logger -t "pf-dns-refresh" "读取端口转发元数据失败"
+        rm -f "$refresh_list"
+        return 1
+    fi
 
     while IFS=$'\t' read -r port addr old_ip tport network family; do
         [ -z "$port" ] && continue
@@ -2376,19 +2385,28 @@ _pf_dns_refresh() {
         [ "$new_ip" == "$old_ip" ] && continue
 
         logger -t "pf-dns-refresh" "域名 $addr 的 IP 已变化: $old_ip -> $new_ip (端口 $port)"
-        _pf_apply_nft_rules "delete" "$port" "$old_ip" "$tport" "$network" "$family"
-        _pf_apply_nft_rules "add" "$port" "$new_ip" "$tport" "$network" "$family"
+        if ! _pf_apply_nft_rules "add" "$port" "$new_ip" "$tport" "$network" "$family"; then
+            logger -t "pf-dns-refresh" "更新端口 $port 的 nftables 规则失败，尝试恢复旧地址 $old_ip"
+            _pf_apply_nft_rules "add" "$port" "$old_ip" "$tport" "$network" "$family" >/dev/null 2>&1
+            continue
+        fi
 
-        jq --arg p "$port" --arg ip "$new_ip" '.[$p].resolved_ip = $ip' "$PF_METADATA_FILE" > "${PF_METADATA_FILE}.tmp" \
-            && mv "${PF_METADATA_FILE}.tmp" "$PF_METADATA_FILE"
+        if ! jq --arg p "$port" --arg ip "$new_ip" '.[$p].resolved_ip = $ip' "$PF_METADATA_FILE" > "${PF_METADATA_FILE}.tmp" \
+            || ! mv "${PF_METADATA_FILE}.tmp" "$PF_METADATA_FILE"; then
+            logger -t "pf-dns-refresh" "更新端口 $port 的元数据失败，尝试恢复旧地址 $old_ip"
+            rm -f "${PF_METADATA_FILE}.tmp"
+            _pf_apply_nft_rules "add" "$port" "$old_ip" "$tport" "$network" "$family" >/dev/null 2>&1
+            continue
+        fi
 
         updated=true
-    done < <(jq -r 'to_entries[] | select(.value.engine == "nftables" and .value.target_is_domain == true and .value.resolved_ip != null) | [.key, .value.target_addr, .value.resolved_ip, (.value.target_port|tostring), .value.network, (.value.target_family // "ipv4")] | @tsv' "$PF_METADATA_FILE" 2>/dev/null)
+    done < "$refresh_list"
 
     if [ "$updated" = true ]; then
         _save_nftables_rules
         logger -t "pf-dns-refresh" "nftables 规则已自动更新"
     fi
+    rm -f "$refresh_list"
 }
 
 _pf_auto_manage_dns_cron() {
@@ -2565,6 +2583,8 @@ _pf_switch_engine() {
 }
 
 _port_forward_menu() {
+    # 进入菜单时同步修复已有 DDNS 规则的 cron 周期和脚本路径。
+    _pf_auto_manage_dns_cron
     while true; do
         clear
         local count=$(_pf_count)
