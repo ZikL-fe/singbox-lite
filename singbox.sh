@@ -43,6 +43,13 @@ _traffic_manager_path() {
     [ -f "$TRAFFIC_MANAGER_SCRIPT" ] && echo "$TRAFFIC_MANAGER_SCRIPT" || echo "${SCRIPT_DIR}/traffic_manager.sh"
 }
 
+_traffic_manager_is_compatible() {
+    local manager="${1:-}"
+    [ -f "$manager" ] &&
+        grep -q '^_tm_ensure_singbox_api()' "$manager" 2>/dev/null &&
+        grep -q 'ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true' "$manager" 2>/dev/null
+}
+
 _record_created_tag() {
     local tag="${1:-}"
     [ -n "$tag" ] || return 0
@@ -73,17 +80,21 @@ _traffic_transaction_release() {
 }
 
 _ensure_traffic_manager() {
-    [ -f "$TRAFFIC_MANAGER_SCRIPT" ] && return 0
+    local bundled_manager="${SCRIPT_DIR}/traffic_manager.sh"
+    local temp_manager="${TRAFFIC_MANAGER_SCRIPT}.tmp.$$"
+    _traffic_manager_is_compatible "$TRAFFIC_MANAGER_SCRIPT" && return 0
     mkdir -p "$SINGBOX_DIR"
-    if [ -f "${SCRIPT_DIR}/traffic_manager.sh" ]; then
-        cp "${SCRIPT_DIR}/traffic_manager.sh" "$TRAFFIC_MANAGER_SCRIPT"
+    if _traffic_manager_is_compatible "$bundled_manager"; then
+        cp "$bundled_manager" "$temp_manager" || return 1
     elif command -v curl >/dev/null 2>&1; then
-        curl -LfsS "${GITHUB_RAW_BASE}/traffic_manager.sh" -o "$TRAFFIC_MANAGER_SCRIPT" || return 1
+        curl -LfsS "${GITHUB_RAW_BASE}/traffic_manager.sh" -o "$temp_manager" || { rm -f "$temp_manager"; return 1; }
     elif command -v wget >/dev/null 2>&1; then
-        wget -q "${GITHUB_RAW_BASE}/traffic_manager.sh" -O "$TRAFFIC_MANAGER_SCRIPT" || return 1
+        wget -q "${GITHUB_RAW_BASE}/traffic_manager.sh" -O "$temp_manager" || { rm -f "$temp_manager"; return 1; }
     else
         return 1
     fi
+    _traffic_manager_is_compatible "$temp_manager" || { rm -f "$temp_manager"; return 1; }
+    mv "$temp_manager" "$TRAFFIC_MANAGER_SCRIPT" || { rm -f "$temp_manager"; return 1; }
     chmod +x "$TRAFFIC_MANAGER_SCRIPT"
 }
 
