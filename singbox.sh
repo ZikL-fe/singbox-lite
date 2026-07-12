@@ -33,6 +33,11 @@ _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 _warning() { _warn "$1"; } # 别名兼容
 _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
 
+_is_valid_port() {
+    local port="${1:-}"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
 TRAFFIC_MANAGER_SCRIPT="${SINGBOX_DIR}/traffic_manager.sh"
 _traffic_manager_path() {
     [ -f "$TRAFFIC_MANAGER_SCRIPT" ] && echo "$TRAFFIC_MANAGER_SCRIPT" || echo "${SCRIPT_DIR}/traffic_manager.sh"
@@ -2738,6 +2743,7 @@ _add_vless_ws_tls() {
         while true; do
             read -p "请输入监听端口 (直连模式下首推 443 端口): " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _is_valid_port "$port" || { _error "端口必须是 1-65535 之间的整数"; continue; }
             _check_port_conflict "$port" "tcp" && continue
             break
         done
@@ -2920,6 +2926,7 @@ _add_vless_grpc_tls() {
         while true; do
             read -p "请输入监听端口 (直连模式下首推 443 端口): " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _is_valid_port "$port" || { _error "端口必须是 1-65535 之间的整数"; continue; }
             _check_port_conflict "$port" "tcp" && continue
             break
         done
@@ -3085,6 +3092,7 @@ _add_trojan_ws_tls() {
         while true; do
             read -p "请输入监听端口 (直连模式下首推 443 端口): " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _is_valid_port "$port" || { _error "端口必须是 1-65535 之间的整数"; continue; }
             _check_port_conflict "$port" "tcp" && continue
             break
         done
@@ -3470,6 +3478,7 @@ _add_anytls() {
         while true; do
             read -p "请输入起始监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _is_valid_port "$port" || { _error "端口必须是 1-65535 之间的整数"; continue; }
             _check_port_conflict "$port" "tcp" && continue
             if [[ "$mode_choice" == "1,2" || "$mode_choice" == "2,1" || "$mode_choice" == "1 2" || "$mode_choice" == "2 1" ]]; then
                 local reality_port=$((port + 1))
@@ -3568,6 +3577,7 @@ _add_vless_reality() {
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _is_valid_port "$port" || { _error "端口必须是 1-65535 之间的整数"; continue; }
             _check_port_conflict "$port" "tcp" && continue
             break
         done
@@ -3614,6 +3624,7 @@ _add_vless_tcp() {
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _is_valid_port "$port" || { _error "端口必须是 1-65535 之间的整数"; continue; }
             _check_port_conflict "$port" "tcp" && continue
             break
         done
@@ -3698,6 +3709,7 @@ _add_hysteria2() {
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _is_valid_port "$port" || { _error "端口必须是 1-65535 之间的整数"; continue; }
             _check_port_conflict "$port" "udp" && continue
             break
         done
@@ -3860,6 +3872,7 @@ _add_tuic() {
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _is_valid_port "$port" || { _error "端口必须是 1-65535 之间的整数"; continue; }
             _check_port_conflict "$port" "udp" && continue
             break
         done
@@ -3966,7 +3979,13 @@ _add_shadowsocks_menu() {
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
-        read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
+        while true; do
+            read -p "请输入监听端口: " port
+            [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _is_valid_port "$port" || { _error "端口必须是 1-65535 之间的整数"; continue; }
+            _check_port_conflict "$port" "tcp" && continue
+            break
+        done
     fi
     
     # [!] 新增：自定义名称
@@ -4133,6 +4152,7 @@ _add_socks() {
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _is_valid_port "$port" || { _error "端口必须是 1-65535 之间的整数"; continue; }
             _check_port_conflict "$port" "tcp" && continue
             break
         done
