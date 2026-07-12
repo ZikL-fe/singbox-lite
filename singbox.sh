@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="17"
+export SCRIPT_VERSION="18"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -57,6 +57,14 @@ _record_created_tag() {
         *$'\n'"$tag"$'\n'*) return 0 ;;
     esac
     CREATED_NODE_TAGS="${CREATED_NODE_TAGS:+${CREATED_NODE_TAGS}$'\n'}${tag}"
+}
+
+_record_config_created_tags() {
+    local before_tags="${1:-}" after_tags="${2:-}" tag
+    while IFS= read -r tag; do
+        [ -z "$tag" ] && continue
+        grep -Fxq "$tag" <<< "$before_tags" || _record_created_tag "$tag"
+    done <<< "$after_tags"
 }
 
 _traffic_prompt_for_created_tags() {
@@ -4993,71 +5001,64 @@ _modify_port() {
 }
 
 # --- 更新管理脚本 ---
+_validate_script_update() {
+    local file="${1:-}" marker="${2:-}"
+    [ -s "$file" ] || return 1
+    bash -n "$file" >/dev/null 2>&1 || return 1
+    [ -z "$marker" ] || grep -q "$marker" "$file" 2>/dev/null
+}
+
+_download_script_update() {
+    local url="$1" output="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -LfsS "$url" -o "$output"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q "$url" -O "$output"
+    else
+        return 1
+    fi
+}
+
+_install_script_update() {
+    local label="$1" url="$2" target="$3" marker="${4:-}" temp="${target}.update.$$"
+    mkdir -p "$(dirname "$target")" || return 1
+    _info "正在更新 ${label} -> ${target}..."
+    _download_script_update "$url" "$temp" || { _error "${label} 下载失败"; rm -f "$temp"; return 1; }
+    _validate_script_update "$temp" "$marker" || { _error "${label} 下载内容无效或语法检查失败"; rm -f "$temp"; return 1; }
+    chmod +x "$temp" && mv "$temp" "$target" || { rm -f "$temp"; return 1; }
+    _success "${label} 更新成功"
+}
+
 _update_script() {
     _info "--- 更新脚本 ---"
-    
-    if [ "$SCRIPT_UPDATE_URL" == "YOUR_GITHUB_RAW_URL_HERE/singbox.sh" ]; then
-        _error "错误：您尚未在脚本中配置 SCRIPT_UPDATE_URL 变量。"
-        _warning "请编辑此脚本，找到 SCRIPT_UPDATE_URL 并填入您正确的 GitHub raw 链接。"
-        return 1
-    fi
+    local script_name script_path new_version
+    local optional_scripts=("advanced_relay.sh" "parser.sh" "xray_manager.sh")
 
-    # 更新主脚本
-    _info "正在从 GitHub 下载最新版本..."
-    local temp_script_path="${SELF_SCRIPT_PATH}.tmp"
-    
-    if wget -qO "$temp_script_path" "$SCRIPT_UPDATE_URL"; then
-        if [ ! -s "$temp_script_path" ]; then
-            _error "主脚本下载失败或文件为空！"
-            rm -f "$temp_script_path"
+    for script_name in "${optional_scripts[@]}"; do
+        script_path=""
+        [ -f "${SINGBOX_DIR}/${script_name}" ] && script_path="${SINGBOX_DIR}/${script_name}"
+        [ -z "$script_path" ] && [ -f "${SCRIPT_DIR}/${script_name}" ] && script_path="${SCRIPT_DIR}/${script_name}"
+        [ -z "$script_path" ] && continue
+        _install_script_update "$script_name" "${GITHUB_RAW_BASE}/${script_name}" "$script_path" '#!/usr/bin/env bash' || {
+            _error "辅助脚本更新未完成，主脚本保持当前版本"
             return 1
-        fi
-        
-        chmod +x "$temp_script_path"
-        mv "$temp_script_path" "$SELF_SCRIPT_PATH"
-        _success "主脚本 (singbox.sh) 更新成功！"
-    else
-        _error "主脚本下载失败！请检查网络或 GitHub 链接。"
-        rm -f "$temp_script_path"
-        return 1
-    fi
-    
-    # 需要更新的子脚本列表
-    local sub_scripts=("advanced_relay.sh" "parser.sh" "xray_manager.sh" "traffic_manager.sh")
-    
-    for script_name in "${sub_scripts[@]}"; do
-        local updated=false
-        # 多路径检测：1. 辅助目录 2. 当前脚本同级目录
-        local paths_to_check=("${SINGBOX_DIR}/${script_name}" "${SCRIPT_DIR}/${script_name}")
-        
-        for script_path in "${paths_to_check[@]}"; do
-            if [ -f "$script_path" ]; then
-                local script_url="${GITHUB_RAW_BASE}/${script_name}"
-                local temp_sub_path="${script_path}.tmp"
-                
-                _info "正在更新子脚本: ${script_name} -> ${script_path}..."
-                if wget -qO "$temp_sub_path" "$script_url"; then
-                    if [ -s "$temp_sub_path" ]; then
-                        chmod +x "$temp_sub_path"
-                        mv "$temp_sub_path" "$script_path"
-                        updated=true
-                        break
-                    else
-                        rm -f "$temp_sub_path"
-                    fi
-                else
-                    rm -f "$temp_sub_path"
-                fi
-            fi
-        done
-        
-        [ "$updated" = true ] && _success "子脚本 (${script_name}) 更新成功。" || _warning "子脚本 ${script_name} 未发现运行中实例或下载失败，跳过更新。"
+        }
     done
-    
-    # 更新 yq 工具（如果缺失或版本过旧）
+
+    _install_script_update "traffic_manager.sh" "${GITHUB_RAW_BASE}/traffic_manager.sh" "$TRAFFIC_MANAGER_SCRIPT" '_tm_main()' || {
+        _error "流量管理组件更新失败，主脚本保持当前版本"
+        return 1
+    }
+
+    local temp_main="${SELF_SCRIPT_PATH}.update.$$"
+    _download_script_update "$SCRIPT_UPDATE_URL" "$temp_main" || { _error "主脚本下载失败"; rm -f "$temp_main"; return 1; }
+    _validate_script_update "$temp_main" 'SCRIPT_VERSION=' || { _error "主脚本下载内容无效或语法检查失败"; rm -f "$temp_main"; return 1; }
+    new_version=$(awk -F'"' '/^export SCRIPT_VERSION=/{print $2; exit}' "$temp_main")
+    chmod +x "$temp_main" && mv "$temp_main" "$SELF_SCRIPT_PATH" || { rm -f "$temp_main"; return 1; }
+    _success "主脚本更新成功"
+
     _install_yq
-    
-    _success "所有脚本组件已更新至最新版 (v${SCRIPT_VERSION})！"
+    _success "脚本组件已更新至 v${new_version:-unknown}"
     _info "请重新运行脚本以应用所有变更："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
     exit 0
@@ -5749,8 +5750,9 @@ EOF
 # 批量创建节点 (v11.3 深度向导版)
 _batch_create_nodes() {
     local input_str="$1"
-    local traffic_new_tag
+    local traffic_new_tag traffic_before_tags traffic_after_tags
     CREATED_NODE_TAGS=""
+    traffic_before_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
     if [ -z "$input_str" ]; then
         _info "请输入协议编号 (空格或逗号分隔，如: 1,6,9)"
         _warn "注：批量部署不支持含有 CDN 的协议 (2, 3, 4)"
@@ -5941,6 +5943,8 @@ _batch_create_nodes() {
     echo -e "${YELLOW}══════════════════════════════════════════════════════${NC}"
 
     _success "批量创建任务已全部完成。"
+    traffic_after_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
+    _record_config_created_tags "$traffic_before_tags" "$traffic_after_tags"
     _traffic_prompt_for_created_tags singbox
     _manage_service restart
     while IFS= read -r traffic_new_tag; do [ -n "$traffic_new_tag" ] && _traffic_verify_tag singbox "$traffic_new_tag" || true; done <<< "$CREATED_NODE_TAGS"
@@ -5949,7 +5953,7 @@ _batch_create_nodes() {
 _show_add_node_menu() {
     local needs_restart=false
     local action_result
-    local new_tag
+    local new_tag before_tags after_tags
     [ -z "$server_ip" ] && _init_server_ip
     clear
     echo -e "${CYAN}"
@@ -5989,6 +5993,7 @@ _show_add_node_menu() {
     fi
 
     CREATED_NODE_TAGS=""
+    before_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
     case $choice in
         1) _add_vless_reality; action_result=$? ;;
         2) _add_vless_ws_tls; action_result=$? ;;
@@ -6007,6 +6012,8 @@ _show_add_node_menu() {
 
     if [ "$action_result" -eq 0 ] 2>/dev/null; then
         needs_restart=true
+        after_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
+        _record_config_created_tags "$before_tags" "$after_tags"
         _traffic_prompt_for_created_tags singbox
     fi
 

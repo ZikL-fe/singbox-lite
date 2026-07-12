@@ -91,13 +91,19 @@ _tm_ensure_stats_client() {
 }
 
 _tm_validate_config() {
-    local core="$1" file="$2"
+    local core="$1" file="$2" output
     if [ "$core" = singbox ]; then
         [ -x "${TM_SINGBOX_BIN:-/usr/local/bin/sing-box}" ] || return 1
-        ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true "${TM_SINGBOX_BIN:-/usr/local/bin/sing-box}" check -c "$file" >/dev/null 2>&1
+        output=$(ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true "${TM_SINGBOX_BIN:-/usr/local/bin/sing-box}" check -c "$file" 2>&1) || {
+            printf 'sing-box config validation failed:\n%s\n' "$output" >&2
+            return 1
+        }
     else
         local client; client=$(_tm_stats_client) || return 1
-        "$client" run -test -config "$file" >/dev/null 2>&1
+        output=$("$client" run -test -config "$file" 2>&1) || {
+            printf 'xray config validation failed:\n%s\n' "$output" >&2
+            return 1
+        }
     fi
 }
 
@@ -142,10 +148,14 @@ _tm_set() {
             if [ "$helper_count" -ne $((helper_max - helper_min + 1)) ]; then echo "Hysteria2 helper ports must be contiguous for traffic quotas" >&2; rm -rf "$backup_dir"; return 1; fi
         fi
     fi
-    _tm_ensure_stats_client || { rm -rf "$backup_dir"; return 1; }
-    if [ "$core" = singbox ]; then _tm_ensure_singbox_api "$tag" || { rm -rf "$backup_dir"; return 1; }; else _tm_ensure_xray_api || { rm -rf "$backup_dir"; return 1; }; fi
+    _tm_ensure_stats_client || { echo "failed to prepare traffic statistics client" >&2; rm -rf "$backup_dir"; return 1; }
+    if [ "$core" = singbox ]; then
+        _tm_ensure_singbox_api "$tag" || { echo "failed to enable sing-box traffic statistics API" >&2; rm -rf "$backup_dir"; return 1; }
+    else
+        _tm_ensure_xray_api || { echo "failed to enable xray traffic statistics API" >&2; rm -rf "$backup_dir"; return 1; }
+    fi
     _tm_atomic_jq '. + {($k): ((.[$k] // {}) + {core:$c,tag:$t,mode:$m,limit_bytes:($l|tonumber),used_bytes:(.[$k].used_bytes // 0),reset_day:(if $r=="" then null else ($r|tonumber) end),period_key:(if $p=="" then null else $p end),member_pattern:$pat,last_uplink:(.[$k].last_uplink // 0),last_downlink:(.[$k].last_downlink // 0),disabled:(.[$k].disabled // false),disabled_reason:(.[$k].disabled_reason // null)})}' \
-        --arg k "$key" --arg c "$core" --arg t "$tag" --arg m "$mode" --arg l "$limit" --arg r "$reset_day" --arg p "$period" --arg pat "$pattern" || { [ -f "$backup_dir/config.json" ] && cp "$backup_dir/config.json" "$config"; rm -rf "$backup_dir"; return 1; }
+        --arg k "$key" --arg c "$core" --arg t "$tag" --arg m "$mode" --arg l "$limit" --arg r "$reset_day" --arg p "$period" --arg pat "$pattern" || { echo "failed to save traffic quota state" >&2; [ -f "$backup_dir/config.json" ] && cp "$backup_dir/config.json" "$config"; rm -rf "$backup_dir"; return 1; }
     if [ "$(jq -r --arg k "$key" '.[$k].disabled // false' "$TM_STATE_FILE")" = true ] && [ "$(jq -r --arg k "$key" '.[$k].used_bytes < .[$k].limit_bytes' "$TM_STATE_FILE")" = true ]; then
         if ! _tm_restore_transaction "$core" "$tag"; then cp "$backup_dir/state.json" "$TM_STATE_FILE"; [ -f "$backup_dir/config.json" ] && cp "$backup_dir/config.json" "$config"; rm -rf "$backup_dir"; return 1; fi
         defer_probe=true
@@ -158,7 +168,7 @@ _tm_set() {
         fi
     fi
     rm -rf "$backup_dir"
-    _tm_install_schedule
+    _tm_install_schedule || { echo "failed to install traffic quota schedule" >&2; return 1; }
 }
 
 _tm_period_key() {
