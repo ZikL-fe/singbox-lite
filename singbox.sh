@@ -154,19 +154,23 @@ _traffic_prompt_for_tag() {
 }
 
 _traffic_show_line() {
-    local core="$1" tag="$2" manager status used limit mode day disabled last_error
+    local core="$1" tag="$2" manager status used limit mode day disabled last_error uplink downlink
     manager=$(_traffic_manager_path); [ -f "$manager" ] || return 0
     status=$(bash "$manager" status "$core" "$tag" 2>/dev/null) || return 0
     [ "$status" = null ] && { echo -e "      流量限制: ${CYAN}无限制${NC}"; return; }
-    read -r used limit mode day disabled < <(echo "$status" | jq -r '[.used_bytes,.limit_bytes,.mode,(.reset_day//0),.disabled] | @tsv')
+    read -r used limit mode day disabled uplink downlink < <(echo "$status" | jq -r '[.used_bytes,.limit_bytes,.mode,(.reset_day//0),.disabled,(.last_uplink//0),(.last_downlink//0)] | @tsv')
     last_error=$(echo "$status" | jq -r '.last_error // empty')
     used=$(bash "$manager" format-bytes "$used"); limit=$(bash "$manager" format-bytes "$limit")
+    uplink=$(bash "$manager" format-bytes "$uplink"); downlink=$(bash "$manager" format-bytes "$downlink")
     if [ "$disabled" = true ]; then
         echo -e "      ${RED}流量超额，节点已停用${NC} | ${used} / ${limit}"
+        echo -e "      上行: ${CYAN}${uplink}${NC} | 下行: ${CYAN}${downlink}${NC}"
     elif [ "$mode" = monthly ]; then
         echo -e "      流量: ${YELLOW}${used} / ${limit}${NC} | 每月 ${day} 日重置"
+        echo -e "      上行: ${CYAN}${uplink}${NC} | 下行: ${CYAN}${downlink}${NC}"
     else
         echo -e "      流量: ${YELLOW}${used} / ${limit}${NC} | 一次性"
+        echo -e "      上行: ${CYAN}${uplink}${NC} | 下行: ${CYAN}${downlink}${NC}"
     fi
     [ -n "$last_error" ] && echo -e "      ${RED}流量统计异常，请检查核心 API${NC}"
 }
