@@ -348,9 +348,9 @@ _tm_query_counters() {
     if [ "$core" = singbox ]; then
         client=$(_tm_singbox_stats_client) || return 1
         raw=$("$client" api stats -json -regexp -server="$endpoint" "^inbound>>>${tag}(>>>|-hop-)" 2>/dev/null) || return 1
-        echo "$raw" | jq -r --arg t "$tag" '[to_entries[]? | select((.key | startswith("inbound>>>" + $t + ">>>")) or (.key | startswith("inbound>>>" + $t + "-hop-"))) | select(.key | endswith(">>>uplink") or endswith(">>>downlink")) | (.value|tonumber)] | add // 0' 2>/dev/null
-        echo "$raw" | jq -r --arg t "$tag" '[to_entries[]? | select((.key | startswith("inbound>>>" + $t + ">>>")) or (.key | startswith("inbound>>>" + $t + "-hop-"))) | select(.key | endswith(">>>uplink")) | (.value|tonumber)] | add // 0' 2>/dev/null
-        echo "$raw" | jq -r --arg t "$tag" '[to_entries[]? | select((.key | startswith("inbound>>>" + $t + ">>>")) or (.key | startswith("inbound>>>" + $t + "-hop-"))) | select(.key | endswith(">>>downlink")) | (.value|tonumber)] | add // 0' 2>/dev/null
+        echo "$raw" | jq -r --arg t "$tag" '[.stat[]? | select((.name | startswith("inbound>>>" + $t + ">>>")) or (.name | startswith("inbound>>>" + $t + "-hop-"))) | select(.name | endswith(">>>uplink") or endswith(">>>downlink")) | (.value|tonumber)] | add // 0' 2>/dev/null
+        echo "$raw" | jq -r --arg t "$tag" '[.stat[]? | select((.name | startswith("inbound>>>" + $t + ">>>")) or (.name | startswith("inbound>>>" + $t + "-hop-"))) | select(.name | endswith(">>>uplink")) | (.value|tonumber)] | add // 0' 2>/dev/null
+        echo "$raw" | jq -r --arg t "$tag" '[.stat[]? | select((.name | startswith("inbound>>>" + $t + ">>>")) or (.name | startswith("inbound>>>" + $t + "-hop-"))) | select(.name | endswith(">>>downlink")) | (.value|tonumber)] | add // 0' 2>/dev/null
     else
         client=$(_tm_stats_client) || return 1
         raw=$("$client" api statsquery --server="$endpoint" -pattern "$pattern" 2>/dev/null) || return 1
