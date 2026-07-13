@@ -2294,6 +2294,93 @@ _uninstall() {
     exit 0
 }
 
+# 确保 config.json 包含 v2ray_api 配置
+_ensure_v2ray_api_config() {
+    [ ! -f "$CONFIG_FILE" ] && return
+
+    # 检查是否已存在 experimental.v2ray_api 配置
+    if jq -e '.experimental.v2ray_api' "$CONFIG_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    _info "正在为既有配置添加 v2ray_api 支持..."
+
+    # 收集所有 inbound tags
+    local inbound_tags=$(jq -r '[.inbounds[]?.tag // empty] | @json' "$CONFIG_FILE")
+
+    # 添加 v2ray_api 配置
+    _atomic_modify_json "$CONFIG_FILE" "
+        .experimental.v2ray_api = {
+            \"listen\": \"127.0.0.1:10086\",
+            \"stats\": {
+                \"enabled\": true,
+                \"inbounds\": $inbound_tags,
+                \"outbounds\": [\"direct\"]
+            }
+        }
+    " || {
+        _error "添加 v2ray_api 配置失败"
+        return 1
+    }
+
+    _success "v2ray_api 配置已添加"
+    return 0
+}
+
+# 安装 v2ray-api 客户端
+_install_v2ray_api_client() {
+    local client_path="/usr/local/bin/v2ray-api"
+
+    # 如果已存在且可执行，直接返回
+    if [ -x "$client_path" ]; then
+        return 0
+    fi
+
+    _info "正在安装 v2ray-api 客户端..."
+
+    # 检测系统架构
+    local arch=$(uname -m)
+    local download_arch=""
+    case "$arch" in
+        x86_64) download_arch="amd64" ;;
+        aarch64|arm64) download_arch="arm64" ;;
+        armv7l) download_arch="armv7" ;;
+        *) _error "不支持的架构: $arch"; return 1 ;;
+    esac
+
+    # 下载 v2ray-api 客户端
+    local download_url="https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-${download_arch}.zip"
+    local tmp_dir=$(mktemp -d)
+
+    _info "下载地址: $download_url"
+    if ! wget -q --show-progress -O "${tmp_dir}/v2ray.zip" "$download_url"; then
+        _error "下载 v2ray-api 客户端失败"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # 解压并提取 v2ctl (v2ray-api 客户端)
+    if ! unzip -q "${tmp_dir}/v2ray.zip" -d "$tmp_dir"; then
+        _error "解压失败"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # v2ray 5.x 之后，命令行工具改名为 v2ray，支持 api 子命令
+    if [ -f "${tmp_dir}/v2ray" ]; then
+        mv "${tmp_dir}/v2ray" "$client_path"
+        chmod +x "$client_path"
+        _success "v2ray-api 客户端安装成功: $client_path"
+    else
+        _error "未找到 v2ray 二进制文件"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    rm -rf "$tmp_dir"
+    return 0
+}
+
 _initialize_config_files() {
     mkdir -p ${SINGBOX_DIR}
     if [ ! -s "$CONFIG_FILE" ]; then
@@ -2332,10 +2419,24 @@ _initialize_config_files() {
   "route": {
     "rules": [],
     "final": "direct"
+  },
+  "experimental": {
+    "v2ray_api": {
+      "listen": "127.0.0.1:10086",
+      "stats": {
+        "enabled": true,
+        "inbounds": [],
+        "outbounds": ["direct"]
+      }
+    }
   }
 }
 EOF
     fi
+
+    # 确保既有配置文件也包含 v2ray_api
+    _ensure_v2ray_api_config
+
     [ -s "$METADATA_FILE" ] || echo "{}" > "$METADATA_FILE"
     
     # [关键修复] 初始化 relay.json - 服务启动命令会加载这个文件
@@ -5100,6 +5201,13 @@ _do_update_singbox() {
             echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
         fi
         _create_service_files
+
+        # 确保 v2ray_api 配置存在
+        _ensure_v2ray_api_config
+
+        # 安装 v2ray-api 客户端（用于流量统计）
+        _install_v2ray_api_client
+
         _info "正在启动/重启 [主] 服务 (sing-box)..."
         if ! _manage_service "restart"; then
             _error "新核心启动失败，正在恢复旧核心"
