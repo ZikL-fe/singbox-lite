@@ -954,77 +954,64 @@ _ensure_nftables() {
     return 0
 }
 
+_singbox_has_traffic_api() {
+    local binary="${1:-}"
+    [ -x "$binary" ] && "$binary" version 2>/dev/null | grep -q 'with_v2ray_api'
+}
+
 _install_sing_box() {
-    _info "正在安装最新稳定版 sing-box..."
-    local arch=$(uname -m)
-    local arch_tag
-    local temp_dir=""
-    local archive_path=""
-    local extracted_bin=""
-    case $arch in
-        x86_64|amd64) arch_tag='amd64' ;;
-        aarch64|arm64) arch_tag='arm64' ;;
-        armv7l) arch_tag='armv7' ;;
-        *) _error "不支持的架构：$arch"; return 1 ;;
-    esac
-    
-    # 检测 C 库类型：Alpine 等系统使用 musl，需要下载对应版本
-    local libc_suffix=""
-    if ldd --version 2>&1 | grep -qi musl || [ -f /etc/alpine-release ]; then
-        _info "检测到 musl libc (Alpine 等系统)，将下载 musl 版本..."
-        libc_suffix="-musl"
-    fi
-    
+    _info "正在构建带流量统计 API 的最新稳定版 sing-box..."
     local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-    local search_pattern="linux-${arch_tag}${libc_suffix}.tar.gz"
-    local release_info=$(curl -s "$api_url")
-    local download_url=$(echo "$release_info" | jq -r ".assets[] | select(.name | contains(\"${search_pattern}\")) | .browser_download_url" | head -1)
+    local release_info version build_parent build_root build_cache source_dir candidate
+    local build_tags="with_quic with_utls with_acme with_clash_api with_v2ray_api"
 
-    if [ -z "$download_url" ]; then _error "无法获取 sing-box 下载链接 (搜索: ${search_pattern})。"; return 1; fi
+    command -v go >/dev/null 2>&1 || _pkg_install golang-go
+    command -v git >/dev/null 2>&1 || _pkg_install git
+    command -v go >/dev/null 2>&1 && command -v git >/dev/null 2>&1 || { _error "安装 Go/Git 构建依赖失败"; return 1; }
 
-    temp_dir=$(mktemp -d /root/.singbox-install.XXXXXX) || { _error "创建临时目录失败。"; return 1; }
-    archive_path="${temp_dir}/sing-box.tar.gz"
+    release_info=$(curl -LfsS "$api_url") || { _error "无法获取 sing-box 最新版本信息"; return 1; }
+    version=$(echo "$release_info" | jq -r '.tag_name // empty')
+    [ -n "$version" ] || { _error "无法解析 sing-box 最新版本号"; return 1; }
 
-    _info "正在下载 sing-box 安装包..."
-    if ! wget -qO "$archive_path" "$download_url"; then
-        _error "下载失败: $download_url"
-        rm -rf "$temp_dir"
+    build_parent="${SINGBOX_BUILD_PARENT:-/var/tmp}"
+    build_cache="${SINGBOX_BUILD_CACHE:-/var/cache/singbox-lite/go-build}"
+    case "$build_parent" in /*) ;; *) _error "构建目录必须是绝对路径"; return 1 ;; esac
+    mkdir -p "$build_parent" "$build_cache" || return 1
+    build_root=$(mktemp -d "${build_parent%/}/singbox-lite-build.XXXXXX") || return 1
+    mkdir -p "$build_root/go-tmp" || return 1
+    source_dir="$build_root/src"
+    candidate="$build_root/sing-box"
+    _info "正在拉取 sing-box ${version} 源码..."
+    git clone -q --depth 1 --branch "$version" https://github.com/SagerNet/sing-box.git "$source_dir" || { _error "sing-box 源码下载失败"; return 1; }
+
+    _info "正在编译 sing-box（首次构建可能需要数分钟）..."
+    if ! (cd "$source_dir" && GOTMPDIR="$build_root/go-tmp" GOCACHE="$build_cache" CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -tags="$build_tags" -o "$candidate" ./cmd/sing-box); then
+        _error "sing-box 自定义核心编译失败，构建目录保留: $build_root"
         return 1
     fi
+    chmod +x "$candidate"
+    _singbox_has_traffic_api "$candidate" || { _error "候选核心缺少 with_v2ray_api"; return 1; }
 
-    _info "正在解压 sing-box 安装包..."
-    if ! tar -xzf "$archive_path" -C "$temp_dir"; then
-        _error "解压 sing-box 安装包失败，临时目录保留: $temp_dir"
-        return 1
+    if [ -s "$CONFIG_FILE" ]; then
+        local check_args=(-c "$CONFIG_FILE")
+        [ -s "${SINGBOX_DIR}/relay.json" ] && check_args+=(-c "${SINGBOX_DIR}/relay.json")
+        ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true \
+        ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true \
+        ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true \
+            "$candidate" check "${check_args[@]}" >/dev/null 2>&1 || {
+                _error "候选核心无法加载当前配置，拒绝安装"
+                return 1
+            }
     fi
 
-    extracted_bin=$(find "$temp_dir" -name sing-box -type f 2>/dev/null | head -n 1)
-    if [ -z "$extracted_bin" ]; then
-        _error "解压后未找到 sing-box 二进制文件，临时目录保留: $temp_dir"
-        return 1
-    fi
-
-    rm -f "$archive_path"
-
-    _info "正在安装 sing-box 二进制文件..."
-    mkdir -p "$(dirname "$SINGBOX_BIN")" || {
-        _error "创建安装目录失败: $(dirname "$SINGBOX_BIN")"
+    mkdir -p "$(dirname "$SINGBOX_BIN")" || return 1
+    [ -x "$SINGBOX_BIN" ] && cp -f "$SINGBOX_BIN" "${SINGBOX_BIN}.pre-traffic-api" || true
+    cp -f "$candidate" "${SINGBOX_BIN}.new" && chmod +x "${SINGBOX_BIN}.new" && mv -f "${SINGBOX_BIN}.new" "$SINGBOX_BIN" || {
+        _error "安装 sing-box 自定义核心失败"
         return 1
     }
-    if ! mv -f "$extracted_bin" "$SINGBOX_BIN"; then
-        _error "安装 sing-box 二进制文件失败: $SINGBOX_BIN"
-        _error "临时目录保留: $temp_dir"
-        return 1
-    fi
-    if ! chmod +x "$SINGBOX_BIN"; then
-        _error "设置 sing-box 可执行权限失败: $SINGBOX_BIN"
-        _error "临时目录保留: $temp_dir"
-        return 1
-    fi
-
-    rm -rf "$temp_dir"
     _release_install_cache
-    _success "sing-box 安装成功: ${SINGBOX_BIN}"
+    _success "sing-box ${version} 安装成功（已启用 with_v2ray_api）"
 }
 
 _install_cloudflared() {
@@ -5087,10 +5074,9 @@ _install_or_update_singbox() {
 # 执行 sing-box 核心的安装/更新
 _do_update_singbox() {
     _info "--- 安装/更新 Sing-box 核心 ---"
+    local backup_bin="${SINGBOX_BIN}.pre-traffic-api"
     _install_dependencies true
-    _install_sing_box
-    
-    if [ $? -eq 0 ]; then
+    if _install_sing_box; then
         _success "sing-box 安装/更新成功！"
         # 确保配置文件存在
         if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${CLASH_YAML_FILE}" ]; then
@@ -5103,7 +5089,24 @@ _do_update_singbox() {
         fi
         _create_service_files
         _info "正在启动/重启 [主] 服务 (sing-box)..."
-        _manage_service "restart"
+        if ! _manage_service "restart"; then
+            _error "新核心启动失败，正在恢复旧核心"
+            if [ -x "$backup_bin" ]; then
+                cp -f "$backup_bin" "$SINGBOX_BIN"
+                chmod +x "$SINGBOX_BIN"
+                _manage_service "restart" >/dev/null 2>&1 || true
+            fi
+            return 1
+        fi
+        if ! _singbox_has_traffic_api "$SINGBOX_BIN"; then
+            _error "新核心未启用流量统计 API，正在恢复旧核心"
+            if [ -x "$backup_bin" ]; then
+                cp -f "$backup_bin" "$SINGBOX_BIN"
+                chmod +x "$SINGBOX_BIN"
+                _manage_service "restart" >/dev/null 2>&1 || true
+            fi
+            return 1
+        fi
         _success "[主] 服务已就绪。"
     else
         _error "Sing-box 核心安装/更新失败。"

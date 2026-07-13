@@ -9,6 +9,7 @@ prompt_source=$(awk '/^_traffic_prompt_for_created_tags\(\)/,/^}/' "${ROOT_DIR}/
 manager_source=$(awk '/^_traffic_manager_is_compatible\(\)/,/^}/' "${ROOT_DIR}/singbox.sh")
 diff_source=$(awk '/^_record_config_created_tags\(\)/,/^}/' "${ROOT_DIR}/singbox.sh")
 update_source=$(awk '/^_validate_script_update\(\)/,/^}/' "${ROOT_DIR}/singbox.sh")
+api_source=$(awk '/^_singbox_has_traffic_api\(\)/,/^}/' "${ROOT_DIR}/singbox.sh")
 
 [ -n "$record_source" ] || { echo "FAIL: _record_created_tag is missing"; exit 1; }
 [ -n "$normalize_source" ] || { echo "FAIL: _normalize_public_ip is missing"; exit 1; }
@@ -16,12 +17,14 @@ update_source=$(awk '/^_validate_script_update\(\)/,/^}/' "${ROOT_DIR}/singbox.s
 [ -n "$manager_source" ] || { echo "FAIL: _traffic_manager_is_compatible is missing"; exit 1; }
 [ -n "$diff_source" ] || { echo "FAIL: _record_config_created_tags is missing"; exit 1; }
 [ -n "$update_source" ] || { echo "FAIL: _validate_script_update is missing"; exit 1; }
+[ -n "$api_source" ] || { echo "FAIL: _singbox_has_traffic_api is missing"; exit 1; }
 eval "$record_source"
 eval "$normalize_source"
 eval "$prompt_source"
 eval "$manager_source"
 eval "$diff_source"
 eval "$update_source"
+eval "$api_source"
 
 CREATED_NODE_TAGS=""
 _record_created_tag "node-a"
@@ -80,6 +83,20 @@ _validate_script_update "$valid_update" EXPECTED_UPDATE_MARKER || {
 }
 if _validate_script_update "$invalid_update"; then
     echo "FAIL: expected invalid script update to be rejected"
+    exit 1
+fi
+
+fake_singbox=$(mktemp)
+trap 'rm -f "$manager_file" "$valid_update" "$invalid_update" "$fake_singbox"' EXIT
+printf '#!/usr/bin/env bash\nprintf "sing-box version 1.13.14\\nTags: with_quic,with_v2ray_api\\n"\n' > "$fake_singbox"
+chmod +x "$fake_singbox"
+_singbox_has_traffic_api "$fake_singbox" || {
+    echo "FAIL: expected custom sing-box traffic API tag"
+    exit 1
+}
+printf '#!/usr/bin/env bash\nprintf "sing-box version 1.13.14\\nTags: with_quic,with_clash_api\\n"\n' > "$fake_singbox"
+if _singbox_has_traffic_api "$fake_singbox"; then
+    echo "FAIL: expected official sing-box without traffic API to be rejected"
     exit 1
 fi
 
