@@ -2348,20 +2348,41 @@ _install_v2ray_api_client() {
         *) _error "不支持的架构: $arch"; return 1 ;;
     esac
 
-    # 下载 v2ray-api 客户端
-    local download_url="https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-${download_arch}.zip"
     local tmp_dir=$(mktemp -d)
+    local download_success=false
 
-    _info "下载地址: $download_url"
-    if ! wget -q --show-progress -O "${tmp_dir}/v2ray.zip" "$download_url"; then
-        _error "下载 v2ray-api 客户端失败"
+    # 尝试多个下载源
+    local mirrors=(
+        "https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-${download_arch}.zip"
+        "https://ghproxy.com/https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-${download_arch}.zip"
+        "https://mirror.ghproxy.com/https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-${download_arch}.zip"
+    )
+
+    for mirror_url in "${mirrors[@]}"; do
+        _info "尝试下载: $mirror_url"
+        if wget --timeout=30 --tries=2 -q --show-progress -O "${tmp_dir}/v2ray.zip" "$mirror_url" 2>&1; then
+            if [ -s "${tmp_dir}/v2ray.zip" ]; then
+                download_success=true
+                _success "下载成功"
+                break
+            fi
+        fi
+        _warn "下载失败，尝试下一个镜像..."
+    done
+
+    if [ "$download_success" = false ]; then
+        _error "所有镜像源下载失败"
+        _warn "你可以手动下载并安装："
+        _warn "  wget https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-${download_arch}.zip"
+        _warn "  unzip v2ray-linux-${download_arch}.zip"
+        _warn "  mv v2ray /usr/local/bin/v2ray-api && chmod +x /usr/local/bin/v2ray-api"
         rm -rf "$tmp_dir"
         return 1
     fi
 
-    # 解压并提取 v2ctl (v2ray-api 客户端)
-    if ! unzip -q "${tmp_dir}/v2ray.zip" -d "$tmp_dir"; then
-        _error "解压失败"
+    # 解压
+    if ! unzip -q "${tmp_dir}/v2ray.zip" -d "$tmp_dir" 2>/dev/null; then
+        _error "解压失败，文件可能损坏"
         rm -rf "$tmp_dir"
         return 1
     fi
