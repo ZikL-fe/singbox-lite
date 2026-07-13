@@ -5516,7 +5516,16 @@ _main_menu() {
         local sb_version=""
         local service_status="○ 未知"
         if [ -f "$SINGBOX_BIN" ]; then
-            sb_version=" v$($SINGBOX_BIN version 2>/dev/null | head -n1 | awk '{print $3}')"
+            local ver_output=$($SINGBOX_BIN version 2>/dev/null | head -n1 | awk '{print $3}')
+            if [ -n "$ver_output" ] && [ "$ver_output" != "unknown" ]; then
+                sb_version=" v${ver_output}"
+            else
+                # 尝试从 Revision 行提取版本信息
+                local revision=$($SINGBOX_BIN version 2>/dev/null | grep "Revision:" | awk '{print $2}' | cut -c1-8)
+                if [ -n "$revision" ]; then
+                    sb_version=" (${revision})"
+                fi
+            fi
             if [ "$INIT_SYSTEM" == "systemd" ]; then
                 if systemctl is-active --quiet sing-box 2>/dev/null; then
                     service_status="${GREEN}● 运行中${NC}"
