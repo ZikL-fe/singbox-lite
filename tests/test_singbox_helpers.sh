@@ -10,6 +10,7 @@ manager_source=$(awk '/^_traffic_manager_is_compatible\(\)/,/^}/' "${ROOT_DIR}/s
 diff_source=$(awk '/^_record_config_created_tags\(\)/,/^}/' "${ROOT_DIR}/singbox.sh")
 update_source=$(awk '/^_validate_script_update\(\)/,/^}/' "${ROOT_DIR}/singbox.sh")
 api_source=$(awk '/^_singbox_has_traffic_api\(\)/,/^}/' "${ROOT_DIR}/singbox.sh")
+diff_prompt_source=$(awk '/^_traffic_prompt_for_tag_diff\(\)/,/^}/' "${ROOT_DIR}/singbox.sh")
 
 [ -n "$record_source" ] || { echo "FAIL: _record_created_tag is missing"; exit 1; }
 [ -n "$normalize_source" ] || { echo "FAIL: _normalize_public_ip is missing"; exit 1; }
@@ -18,6 +19,7 @@ api_source=$(awk '/^_singbox_has_traffic_api\(\)/,/^}/' "${ROOT_DIR}/singbox.sh"
 [ -n "$diff_source" ] || { echo "FAIL: _record_config_created_tags is missing"; exit 1; }
 [ -n "$update_source" ] || { echo "FAIL: _validate_script_update is missing"; exit 1; }
 [ -n "$api_source" ] || { echo "FAIL: _singbox_has_traffic_api is missing"; exit 1; }
+[ -n "$diff_prompt_source" ] || { echo "FAIL: _traffic_prompt_for_tag_diff is missing"; exit 1; }
 eval "$record_source"
 eval "$normalize_source"
 eval "$prompt_source"
@@ -25,6 +27,7 @@ eval "$manager_source"
 eval "$diff_source"
 eval "$update_source"
 eval "$api_source"
+eval "$diff_prompt_source"
 
 CREATED_NODE_TAGS=""
 _record_created_tag "node-a"
@@ -99,5 +102,15 @@ if _singbox_has_traffic_api "$fake_singbox"; then
     echo "FAIL: expected official sing-box without traffic API to be rejected"
     exit 1
 fi
+
+PROMPTED_TAGS=""
+_traffic_prompt_for_tag() {
+    PROMPTED_TAGS="${PROMPTED_TAGS:+${PROMPTED_TAGS}$'\n'}$2"
+}
+_traffic_prompt_for_tag_diff singbox $'existing\nold' $'existing\nold\nvless-tcp-in-23456\nhy2-hop-23457'
+[ "$PROMPTED_TAGS" = "vless-tcp-in-23456" ] || {
+    printf 'FAIL: unexpected diff-prompt tags: <%s>\n' "$PROMPTED_TAGS"
+    exit 1
+}
 
 echo "All sing-box helper tests passed"

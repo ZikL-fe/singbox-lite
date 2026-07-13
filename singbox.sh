@@ -67,6 +67,18 @@ _record_config_created_tags() {
     done <<< "$after_tags"
 }
 
+_traffic_prompt_for_tag_diff() {
+    local core="$1" before_snapshot="${2:-}" after_snapshot="${3:-}" created_tag
+    while IFS= read -r created_tag; do
+        [ -z "$created_tag" ] && continue
+        [[ "$created_tag" == *-hop-* ]] && continue
+        if ! grep -Fxq "$created_tag" <<< "$before_snapshot"; then
+            _record_created_tag "$created_tag"
+            _traffic_prompt_for_tag "$core" "$created_tag" || true
+        fi
+    done <<< "$after_snapshot"
+}
+
 _traffic_prompt_for_created_tags() {
     local core="$1" tag
     while IFS= read -r tag; do
@@ -5947,8 +5959,7 @@ _batch_create_nodes() {
 
     _success "批量创建任务已全部完成。"
     traffic_after_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
-    _record_config_created_tags "$traffic_before_tags" "$traffic_after_tags"
-    _traffic_prompt_for_created_tags singbox
+    _traffic_prompt_for_tag_diff singbox "$traffic_before_tags" "$traffic_after_tags"
     _manage_service restart
     while IFS= read -r traffic_new_tag; do [ -n "$traffic_new_tag" ] && _traffic_verify_tag singbox "$traffic_new_tag" || true; done <<< "$CREATED_NODE_TAGS"
 }
@@ -6016,8 +6027,7 @@ _show_add_node_menu() {
     if [ "$action_result" -eq 0 ] 2>/dev/null; then
         needs_restart=true
         after_tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
-        _record_config_created_tags "$before_tags" "$after_tags"
-        _traffic_prompt_for_created_tags singbox
+        _traffic_prompt_for_tag_diff singbox "$before_tags" "$after_tags"
     fi
 
     if [ "$needs_restart" = true ]; then
