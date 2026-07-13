@@ -18,11 +18,13 @@ export TM_LOCK_DIR="$tmp/traffic.lock"
 export TM_RESTART_SINGBOX_CMD="printf restarted > '$tmp/singbox.restart'"
 export TM_RESTART_XRAY_CMD="printf 'restarted\\n' >> '$tmp/xray.restart'"
 export TM_XRAY_BIN="$tmp/fake-xray"
+export TM_V2RAY_CLIENT_BIN="$tmp/fake-v2ray"
 export TM_SINGBOX_BIN="$tmp/fake-singbox"
 mkdir -p "$TM_DIR" "$tmp/xray"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TM_XRAY_BIN"
 chmod +x "$TM_XRAY_BIN"
 cp "$TM_XRAY_BIN" "$TM_SINGBOX_BIN"
+cp "$TM_XRAY_BIN" "$TM_V2RAY_CLIENT_BIN"
 
 cat > "$TM_SINGBOX_CONFIG" <<'JSON'
 {"inbounds":[{"type":"vless","tag":"vless-in-443","listen":"::","listen_port":443}],"outbounds":[],"route":{"rules":[]}}

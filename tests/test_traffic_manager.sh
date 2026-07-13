@@ -36,7 +36,7 @@ assert_eq "2026-03-31" "$(_tm_period_key 2026-03-31 31)" "period on reset bounda
 assert_eq true "$(_tm_is_exceeded 100 100)" "quota reached"
 assert_eq false "$(_tm_is_exceeded 99 100)" "quota remains"
 
-for required_function in _tm_ensure_singbox_api _tm_ensure_xray_api _tm_query_counters _tm_check _tm_install_schedule; do
+for required_function in _tm_ensure_singbox_api _tm_ensure_xray_api _tm_singbox_stats_client _tm_query_counters _tm_check _tm_install_schedule; do
     if ! declare -f "$required_function" >/dev/null 2>&1; then
         printf 'FAIL: required enforcement function missing: %s\n' "$required_function"
         failures=$((failures + 1))

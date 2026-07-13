@@ -5,6 +5,7 @@ TM_STATE_FILE="${TM_STATE_FILE:-${TM_DIR}/traffic_limits.json}"
 TM_LOCK_DIR="${TM_LOCK_DIR:-/tmp/singbox-lite-traffic.lock}"
 TM_SCRIPT_PATH="${TM_SCRIPT_PATH:-/usr/local/etc/sing-box/traffic_manager.sh}"
 TM_XRAY_CLIENT_BIN="${TM_XRAY_CLIENT_BIN:-/usr/local/lib/singbox-lite/xray-api}"
+TM_V2RAY_CLIENT_BIN="${TM_V2RAY_CLIENT_BIN:-/usr/local/lib/singbox-lite/v2ray-api}"
 
 _tm_parse_size() {
     local input number unit
@@ -107,6 +108,45 @@ _tm_validate_config() {
     fi
 }
 
+_tm_singbox_stats_client() {
+    [ -x "$TM_V2RAY_CLIENT_BIN" ] && { echo "$TM_V2RAY_CLIENT_BIN"; return; }
+    return 1
+}
+
+_tm_download_verified_client() {
+    local project="$1" asset="$2" binary_name="$3" destination="$4" tmp url expected actual
+    command -v unzip >/dev/null 2>&1 || { echo "unzip is required" >&2; return 1; }
+    command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required" >&2; return 1; }
+    tmp=$(mktemp -d) || return 1
+    url="https://github.com/${project}/releases/latest/download/${asset}.zip"
+    if command -v curl >/dev/null 2>&1; then
+        curl -LfsS "$url" -o "$tmp/client.zip" && curl -LfsS "${url}.dgst" -o "$tmp/client.zip.dgst" || { rm -rf "$tmp"; return 1; }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q "$url" -O "$tmp/client.zip" && wget -q "${url}.dgst" -O "$tmp/client.zip.dgst" || { rm -rf "$tmp"; return 1; }
+    else rm -rf "$tmp"; return 1; fi
+    expected=$(grep -Eio '[a-f0-9]{64}' "$tmp/client.zip.dgst" | head -1)
+    actual=$(sha256sum "$tmp/client.zip" | awk '{print $1}')
+    [ -n "$expected" ] && [ "${expected,,}" = "${actual,,}" ] || { echo "${binary_name} checksum verification failed" >&2; rm -rf "$tmp"; return 1; }
+    unzip -qo "$tmp/client.zip" "$binary_name" -d "$tmp" || { rm -rf "$tmp"; return 1; }
+    mkdir -p "$(dirname "$destination")" && mv "$tmp/$binary_name" "$destination" && chmod +x "$destination"
+    rm -rf "$tmp"
+}
+
+_tm_ensure_core_stats_client() {
+    if [ "$1" = singbox ]; then
+        _tm_ensure_singbox_stats_client
+    else
+        _tm_ensure_stats_client
+    fi
+}
+
+_tm_ensure_singbox_stats_client() {
+    _tm_singbox_stats_client >/dev/null 2>&1 && return 0
+    local asset
+    case "$(uname -m)" in x86_64|amd64) asset=v2ray-linux-64;; aarch64|arm64) asset=v2ray-linux-arm64-v8a;; armv7l) asset=v2ray-linux-arm32-v7a;; *) return 1;; esac
+    _tm_download_verified_client v2fly/v2ray-core "$asset" v2ray "$TM_V2RAY_CLIENT_BIN"
+}
+
 _tm_init() {
     _tm_require_jq || return 1
     mkdir -p "$TM_DIR"
@@ -148,7 +188,7 @@ _tm_set() {
             if [ "$helper_count" -ne $((helper_max - helper_min + 1)) ]; then echo "Hysteria2 helper ports must be contiguous for traffic quotas" >&2; rm -rf "$backup_dir"; return 1; fi
         fi
     fi
-    _tm_ensure_stats_client || { echo "failed to prepare traffic statistics client" >&2; rm -rf "$backup_dir"; return 1; }
+    _tm_ensure_core_stats_client "$core" || { echo "failed to prepare traffic statistics client" >&2; rm -rf "$backup_dir"; return 1; }
     if [ "$core" = singbox ]; then
         _tm_ensure_singbox_api "$tag" || { echo "failed to enable sing-box traffic statistics API" >&2; rm -rf "$backup_dir"; return 1; }
     else
@@ -304,11 +344,20 @@ _tm_query_counters() {
     endpoint="${TM_XRAY_API_LISTEN:-127.0.0.1:10085}"
     [ "$core" = singbox ] && endpoint="${TM_SINGBOX_API_LISTEN:-127.0.0.1:10086}"
     pattern="inbound>>>${tag}"
-    local client; client=$(_tm_stats_client) || return 1
-    raw=$("$client" api statsquery --server="$endpoint" -pattern "$pattern" 2>/dev/null) || return 1
-    echo "$raw" | jq -r --arg t "$tag" '[.stat[]? | select((.name | startswith("inbound>>>" + $t + ">>>")) or (.name | startswith("inbound>>>" + $t + "-hop-"))) | select(.name | endswith(">>>uplink") or endswith(">>>downlink")) | (.value|tonumber)] | add // 0' 2>/dev/null
-    echo "$raw" | jq -r --arg t "$tag" '[.stat[]? | select((.name | startswith("inbound>>>" + $t + ">>>")) or (.name | startswith("inbound>>>" + $t + "-hop-"))) | select(.name | endswith(">>>uplink")) | (.value|tonumber)] | add // 0' 2>/dev/null
-    echo "$raw" | jq -r --arg t "$tag" '[.stat[]? | select((.name | startswith("inbound>>>" + $t + ">>>")) or (.name | startswith("inbound>>>" + $t + "-hop-"))) | select(.name | endswith(">>>downlink")) | (.value|tonumber)] | add // 0' 2>/dev/null
+    local client
+    if [ "$core" = singbox ]; then
+        client=$(_tm_singbox_stats_client) || return 1
+        raw=$("$client" api stats -json -regexp -server="$endpoint" "^inbound>>>${tag}(>>>|-hop-)" 2>/dev/null) || return 1
+        echo "$raw" | jq -r --arg t "$tag" '[to_entries[]? | select((.key | startswith("inbound>>>" + $t + ">>>")) or (.key | startswith("inbound>>>" + $t + "-hop-"))) | select(.key | endswith(">>>uplink") or endswith(">>>downlink")) | (.value|tonumber)] | add // 0' 2>/dev/null
+        echo "$raw" | jq -r --arg t "$tag" '[to_entries[]? | select((.key | startswith("inbound>>>" + $t + ">>>")) or (.key | startswith("inbound>>>" + $t + "-hop-"))) | select(.key | endswith(">>>uplink")) | (.value|tonumber)] | add // 0' 2>/dev/null
+        echo "$raw" | jq -r --arg t "$tag" '[to_entries[]? | select((.key | startswith("inbound>>>" + $t + ">>>")) or (.key | startswith("inbound>>>" + $t + "-hop-"))) | select(.key | endswith(">>>downlink")) | (.value|tonumber)] | add // 0' 2>/dev/null
+    else
+        client=$(_tm_stats_client) || return 1
+        raw=$("$client" api statsquery --server="$endpoint" -pattern "$pattern" 2>/dev/null) || return 1
+        echo "$raw" | jq -r --arg t "$tag" '[.stat[]? | select((.name | startswith("inbound>>>" + $t + ">>>")) or (.name | startswith("inbound>>>" + $t + "-hop-"))) | select(.name | endswith(">>>uplink") or endswith(">>>downlink")) | (.value|tonumber)] | add // 0' 2>/dev/null
+        echo "$raw" | jq -r --arg t "$tag" '[.stat[]? | select((.name | startswith("inbound>>>" + $t + ">>>")) or (.name | startswith("inbound>>>" + $t + "-hop-"))) | select(.name | endswith(">>>uplink")) | (.value|tonumber)] | add // 0' 2>/dev/null
+        echo "$raw" | jq -r --arg t "$tag" '[.stat[]? | select((.name | startswith("inbound>>>" + $t + ">>>")) or (.name | startswith("inbound>>>" + $t + "-hop-"))) | select(.name | endswith(">>>downlink")) | (.value|tonumber)] | add // 0' 2>/dev/null
+    fi
 }
 
 _tm_probe() {
@@ -515,6 +564,7 @@ _tm_cleanup() {
         jq 'if .api.tag == "traffic-api" then del(.api) else . end | .inbounds = [.inbounds[]? | select(.tag != "traffic-api")] | .routing.rules = [.routing.rules[]? | select(.outboundTag != "traffic-api")] | if .policy.system then del(.policy.system.statsInboundUplink,.policy.system.statsInboundDownlink) else . end' "$config" > "$tmp" && mv "$tmp" "$config"
     fi
     [ "$TM_XRAY_CLIENT_BIN" = "/usr/local/lib/singbox-lite/xray-api" ] && rm -f "$TM_XRAY_CLIENT_BIN"
+    [ "$TM_V2RAY_CLIENT_BIN" = "/usr/local/lib/singbox-lite/v2ray-api" ] && rm -f "$TM_V2RAY_CLIENT_BIN"
 }
 
 _tm_usage() {
