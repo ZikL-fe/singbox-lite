@@ -2360,11 +2360,15 @@ _install_v2ray_api_client() {
 
     for mirror_url in "${mirrors[@]}"; do
         _info "尝试下载: $mirror_url"
-        if wget --timeout=30 --tries=2 -q --show-progress -O "${tmp_dir}/v2ray.zip" "$mirror_url" 2>&1; then
-            if [ -s "${tmp_dir}/v2ray.zip" ]; then
+        if wget --timeout=30 --tries=2 --max-redirect=5 -L -q --show-progress -O "${tmp_dir}/v2ray.zip" "$mirror_url" 2>&1; then
+            # 检查文件大小是否合理（至少 1MB）
+            local file_size=$(stat -f%z "${tmp_dir}/v2ray.zip" 2>/dev/null || stat -c%s "${tmp_dir}/v2ray.zip" 2>/dev/null || echo 0)
+            if [ "$file_size" -gt 1048576 ]; then
                 download_success=true
-                _success "下载成功"
+                _success "下载成功 ($(( file_size / 1024 / 1024 )) MB)"
                 break
+            else
+                _warn "下载的文件过小 ($file_size bytes)，可能不完整"
             fi
         fi
         _warn "下载失败，尝试下一个镜像..."
